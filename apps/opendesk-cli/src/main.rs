@@ -249,32 +249,34 @@ async fn view(
     };
     tokio::time::sleep(Duration::from_secs_f32(seconds.max(0.0))).await;
 
-    let frame = viewer.frame.lock().unwrap();
-    let elapsed = started.elapsed().as_secs_f64();
-    println!("Primeiro quadro em {:.0} ms", first_frame.as_secs_f64() * 1000.0);
-    if let Some(rtt) = viewer.rtt() {
-        println!("Latência (ida e volta): {:.1} ms", rtt.as_secs_f64() * 1000.0);
-    }
-    println!(
-        "{} quadros em {:.1} s ({:.1} qps), {:.2} MB recebidos ({:.2} Mbit/s)",
-        frame.frames,
-        elapsed,
-        frame.frames as f64 / elapsed,
-        frame.bytes as f64 / 1e6,
-        frame.bytes as f64 * 8.0 / 1e6 / elapsed
-    );
-    if let Some(path) = out {
-        let file = std::fs::File::create(&path).with_context(|| format!("criar {}", path.display()))?;
-        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), frame.width as u32, frame.height as u32);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder.set_compression(png::Compression::Fast);
-        encoder.write_header()?.write_image_data(&frame.rgba)?;
-        println!("Tela remota salva em {}", path.display());
+    {
+        // A trava do quadro não pode atravessar um `await`.
+        let frame = viewer.frame.lock().unwrap();
+        let elapsed = started.elapsed().as_secs_f64();
+        println!("Primeiro quadro em {:.0} ms", first_frame.as_secs_f64() * 1000.0);
+        if let Some(rtt) = viewer.rtt() {
+            println!("Latência (ida e volta): {:.1} ms", rtt.as_secs_f64() * 1000.0);
+        }
+        println!(
+            "{} quadros em {:.1} s ({:.1} qps), {:.2} MB recebidos ({:.2} Mbit/s)",
+            frame.frames,
+            elapsed,
+            frame.frames as f64 / elapsed,
+            frame.bytes as f64 / 1e6,
+            frame.bytes as f64 * 8.0 / 1e6 / elapsed
+        );
+        if let Some(path) = out {
+            let file = std::fs::File::create(&path).with_context(|| format!("criar {}", path.display()))?;
+            let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), frame.width as u32, frame.height as u32);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_compression(png::Compression::Fast);
+            encoder.write_header()?.write_image_data(&frame.rgba)?;
+            println!("Tela remota salva em {}", path.display());
+        }
     }
     // Despede-se do host em vez de simplesmente sumir, para ele liberar a
     // sessão na hora.
-    drop(frame);
     viewer.disconnect();
     let _ = tokio::time::timeout(Duration::from_secs(1), async {
         while let Some(event) = events.recv().await {

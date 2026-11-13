@@ -6,8 +6,7 @@ members = ["crates/*", "apps/*"]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-rust-version = "1.85"
-description = "OpenDesk: acesso remoto P2P, gratuito e de código aberto"
+rust-version = "1.88"
 
 [workspace.dependencies]
 opendesk-proto = { path = "crates/opendesk-proto" }

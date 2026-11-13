@@ -3,6 +3,7 @@ name = "opendesk-relay"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "Relay do OpenDesk: repassa pacotes cifrados entre dois dispositivos que não conseguem se conectar direto"
 
 [dependencies]

@@ -3,6 +3,7 @@ name = "opendesk-platform"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "Camada de sistema operacional do OpenDesk: captura de tela, injeção de entrada e captura de teclado"
 
 [dependencies]

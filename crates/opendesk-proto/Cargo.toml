@@ -3,6 +3,7 @@ name = "opendesk-proto"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "Protocolo de fio do OpenDesk: mensagens de controle, pacotes de vídeo e enquadramento"
 
 [dependencies]

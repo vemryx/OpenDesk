@@ -3,6 +3,7 @@ name = "opendesk-session"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "Lógica de sessão do OpenDesk: o lado que compartilha a tela (host) e o lado que vê e controla (visualizador)"
 
 [dependencies]

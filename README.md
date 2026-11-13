@@ -25,7 +25,7 @@ Na primeira execução o Firewall do Windows pergunta se o OpenDesk pode receber
 
 ## Compilar
 
-Requer [Rust](https://rustup.rs) 1.85 ou mais novo e as Ferramentas de Build do Visual Studio.
+Requer [Rust](https://rustup.rs) 1.88 ou mais novo e as Ferramentas de Build do Visual Studio.
 
 ```bash
 cargo build --release
