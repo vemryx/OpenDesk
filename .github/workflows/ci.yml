@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatação
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Testes
+        run: cargo test --workspace
+      - name: Build de release
+        run: cargo build --release --workspace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opendesk-windows-x64
+          path: |
+            target/release/opendesk.exe
+            target/release/opendesk-cli.exe
+            target/release/opendesk-relay.exe
+          if-no-files-found: error
+
+  relay-linux:
+    name: Relay (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Testes do relay e do protocolo
+        run: cargo test -p opendesk-relay -p opendesk-proto
+      - name: Build de release
+        run: cargo build --release -p opendesk-relay
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opendesk-relay-linux-x64
+          path: target/release/opendesk-relay
+          if-no-files-found: error
+
+  rendezvous:
+    name: Servidor de encontro
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rendezvous
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run check

@@ -41,6 +41,7 @@ O OpenDesk não é "o RustDesk, só que P2P": o RustDesk também conecta ponto a
 | `opendesk-session` | Máquinas de estado do host e do visualizador | Não |
 | `apps/opendesk` | Interface gráfica (egui/eframe sobre wgpu) | Pouco |
 | `apps/opendesk-cli` | Diagnóstico e teste ponta a ponta sem interface | Não |
+| `opendesk-relay` | Relay UDP auto-hospedado, para quando a conexão direta falha | Não |
 | `rendezvous/` | Servidor de encontro (Cloudflare Worker + Durable Objects, TypeScript) | — |
 
 Portar o OpenDesk para outro sistema é implementar `opendesk-platform` para ele.
@@ -89,16 +90,18 @@ Visualizador                 Servidor de encontro                    Host
 
 O que isso **não** resolve: NAT simétrico dos dois lados, redes que bloqueiam UDP e alguns CGNAT. Para esses casos é preciso relay.
 
-### Relay (projetado, ainda não implementado)
+### Relay
 
-Como a sessão é QUIC com TLS de ponta a ponta entre os dois dispositivos, o relay pode ser um encaminhador de datagramas UDP burro: ele recebe pacotes de um par e os repassa ao outro, sem conseguir ler nem alterar nada. Para o QUIC, o endereço do relay simplesmente passa a ser "o endereço do outro lado". O plano:
+Para quando a conexão direta não passa. Como a sessão é QUIC com TLS de ponta a ponta entre os dois dispositivos, o relay é um encaminhador de datagramas UDP burro: recebe pacotes de um par e os repassa ao outro, sem chave nenhuma, sem conseguir ler nem alterar nada. Ele enxerga endereços e volume de tráfego, e só.
 
-- um binário pequeno (`opendesk-relay`) que qualquer pessoa roda numa máquina com IP público;
-- o host indica um relay na resposta do encontro, com um token de sessão; os dois lados se apresentam ao relay com o token e ele passa a encaminhar entre os dois endereços;
-- o visualizador tenta os candidatos diretos primeiro e só cai no relay se nenhum responder; a barra da sessão mostra "Relay" em vez de "Direta";
-- **relays comunitários**: uma lista pública de relays voluntários que o aplicativo pode usar. Isso exige o que ainda não existe: limite de banda e de sessões por relay, tokens emitidos pelo servidor de encontro para que só sessões legítimas usem o relay, e medição de saúde para escolher um relay bom. Sem esses controles, um relay aberto vira banda grátis para qualquer coisa.
+- **`opendesk-relay`** (`crates/opendesk-relay`) é um binário pequeno que qualquer pessoa roda numa máquina com IP público e uma porta UDP aberta (47800 por padrão). Compila para Windows e Linux.
+- **Envelope.** Cada pacote vai como `0x02 | token de 16 bytes | pacote QUIC`. O relay junta os dois primeiros endereços que aparecerem com o mesmo token e repassa entre eles.
+- **Combinação.** Basta **um** dos lados ter um relay configurado (`OPENDESK_RELAY=host:porta`). O visualizador sugere o seu no pedido; o host usa o próprio se tiver, senão aceita o sugerido, e sorteia o token. A escolha volta na resposta do encontro.
+- **Transparente para o QUIC.** No socket do nó, um par alcançado por relay ganha um endereço virtual (faixa reservada 240.0.0.0/4). Pacotes para esse endereço são embrulhados e mandados ao relay; os que chegam do relay são desembrulhados e entregues como vindos do endereço virtual. O resto do código não muda.
+- **Direto primeiro.** O visualizador tenta os candidatos diretos por 4 s e só então usa o relay. A barra da sessão mostra "Via relay" quando é o caso.
+- **Limites contra abuso** no relay: sessões simultâneas (256), banda por sessão (20 Mbit/s), sessões novas por IP por minuto (30) e expiração por inatividade (30 s). Tudo ajustável por parâmetro.
 
-Enquanto o relay não existir, o OpenDesk não promete conexão em qualquer rede.
+O que ainda não existe são os **relays comunitários**: uma lista pública de relays voluntários que o aplicativo use sozinho. Para isso faltam tokens emitidos pelo servidor de encontro (hoje qualquer par que conheça o endereço de um relay pode usá-lo, dentro dos limites), medição de saúde para escolher um relay bom, e um jeito de publicar e retirar relays da lista. Enquanto isso não existir, o relay é "traga o seu", e o OpenDesk não promete conexão em qualquer rede sem ele.
 
 ## Protocolo de sessão
 
@@ -136,7 +139,7 @@ O AnyDesk foi usado como **referência de arquitetura, não de código**. A aná
 | No AnyDesk (observado) | A ideia | No OpenDesk |
 |---|---|---|
 | `anynet.punch_connector`: tenta vários endereços candidatos em paralelo | Perfuração de NAT com candidatos | **Feito**: `Node::punch` + `Node::connect_any` sobre o socket QUIC único |
-| `anynet.relay_connector`, `main_relay_conn`: TLS até um relay da empresa | Relay quando o P2P falha | **Projetado**: relay UDP auto-hospedado e comunitário; o tráfego continua cifrado ponta a ponta |
+| `anynet.relay_connector`, `main_relay_conn`: TLS até um relay da empresa | Relay quando o P2P falha | **Feito**: `opendesk-relay`, auto-hospedado, sem acesso ao conteúdo. Relays comunitários no roteiro |
 | `anynet.connection_mgr`: "Found N direct connection candidates" | Trocar candidatos locais pelo servidor | **Feito**: servidor de encontro (Cloudflare Workers + Durable Objects) |
 | `anynet.tcp_acceptor` + `os_win.upnp_config` | Escuta direta e mapeamento UPnP | Escuta direta **feita** (UDP 47700); UPnP no roteiro |
 | `app.discovery`: grupo multicast | Achar computadores na rede local | **Roteiro**: descoberta por multicast |
@@ -154,19 +157,21 @@ Onde o OpenDesk diverge de propósito: QUIC em vez de protocolo próprio sobre T
 
 ## Roteiro
 
-1. **Publicar o servidor de encontro** e fixar o endereço padrão no aplicativo. Hoje é preciso apontar para um servidor próprio com `OPENDESK_RENDEZVOUS`.
-2. **Relay**: `opendesk-relay` auto-hospedado, depois relays comunitários com controle de abuso.
-3. **Desempenho**: codec de vídeo na GPU, qualidade adaptativa, teto de bitrate.
+1. **Relays comunitários**: lista pública, tokens emitidos pelo servidor de encontro, escolha automática.
+2. **Desempenho**: codec de vídeo na GPU, qualidade adaptativa, teto de bitrate.
+3. **Vários visualizadores** no mesmo host, compartilhando uma única captura de tela.
 4. **Experiência**: área de transferência, transferência de arquivos, múltiplos monitores, cursor remoto, catálogo de computadores recentes.
 5. **Segurança**: gerenciar hosts fixados pela interface, chave protegida por DPAPI, registro local de sessões.
 6. **Serviço Windows**: UAC e tela de logon, acesso não supervisionado com senha (PAKE).
-7. **Distribuição**: builds automáticos, assinatura de código (SignPath para projetos abertos), Linux e macOS.
+7. **Distribuição**: releases automáticos, assinatura de código (SignPath para projetos abertos), Linux e macOS, domínio próprio para o servidor de encontro.
 
 ## Limitações conhecidas
 
 - Só Windows.
-- Conexão por ID exige um servidor de encontro configurado, e ainda não há um público do projeto.
-- Sem relay: se os roteadores dos dois lados não permitirem perfuração (NAT simétrico, UDP bloqueado), a conexão pela internet falha. A perfuração entre duas redes diferentes ainda não foi testada em campo, só o encontro e a conexão na mesma máquina e a descoberta do endereço público.
+- O servidor de encontro padrão é uma instância no plano gratuito da Cloudflare, num endereço `workers.dev`. Serve para começar; um projeto com muitos usuários precisa de domínio próprio e de acompanhar os limites do plano.
+- Não há relay público. Se os roteadores dos dois lados não permitirem perfuração (NAT simétrico, UDP bloqueado), a conexão pela internet só acontece com um relay próprio configurado.
+- A perfuração entre duas redes diferentes ainda não foi testada em campo. Foram testados o encontro, a conexão direta e a conexão por relay na mesma máquina, e a descoberta do endereço público.
+- O host atende um visualizador por vez (o Windows só permite uma captura de tela por processo); um segundo pedido recebe "ocupado".
 - IPv6 não é usado.
 - Janelas elevadas e o prompt do UAC não recebem entrada nem são capturados (exige o serviço).
 - Monitores rotacionados não são corrigidos; só o monitor principal é compartilhado pela interface.

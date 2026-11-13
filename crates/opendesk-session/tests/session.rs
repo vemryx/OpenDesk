@@ -234,6 +234,26 @@ async fn rejected_request_never_shares_the_screen() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn second_viewer_is_told_the_host_is_busy_then_can_connect_later() {
+    let (_shared, _host, addr, mut ended) = start_host(Some(Permissions::VIEW_ONLY));
+    let (first, mut first_events) = start_viewer(addr, Permissions::VIEW_ONLY);
+    next(&mut first_events).await;
+    assert!(matches!(next(&mut first_events).await, ViewerEvent::Granted { .. }));
+
+    let (_second, mut second_events) = start_viewer(addr, Permissions::VIEW_ONLY);
+    next(&mut second_events).await;
+    assert!(matches!(next(&mut second_events).await, ViewerEvent::Denied(DenyReason::Busy)));
+    assert!(matches!(next(&mut second_events).await, ViewerEvent::Closed(reason) if reason.contains("outra sessão")));
+
+    // Quando a primeira sessão termina, o host volta a aceitar.
+    drop(first);
+    tokio::time::timeout(Duration::from_secs(10), ended.recv()).await.unwrap().unwrap();
+    let (_third, mut third_events) = start_viewer(addr, Permissions::VIEW_ONLY);
+    next(&mut third_events).await;
+    assert!(matches!(next(&mut third_events).await, ViewerEvent::Granted { .. }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn viewer_disconnect_ends_the_host_session() {
     let (_shared, _host, addr, mut ended) = start_host(Some(Permissions::FULL));
     let (viewer, mut events) = start_viewer(addr, Permissions::FULL);

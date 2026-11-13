@@ -12,6 +12,7 @@
 //! os bytes. Tudo aqui deve tratar a entrada como hostil.
 
 pub mod control;
+pub mod relay;
 pub mod video;
 pub mod wire;
 

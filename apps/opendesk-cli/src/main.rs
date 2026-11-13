@@ -136,7 +136,7 @@ async fn host(
             let node = node.clone();
             tokio::spawn(async move {
                 let servers = lookup.stun_servers.clone();
-                lookup.rendezvous.serve(node, servers, print_presence).await;
+                lookup.rendezvous.serve(node, servers, lookup.relay.clone(), print_presence).await;
             });
         }
         None => println!("Sem servidor de encontro: só é possível conectar pelo endereço acima."),
@@ -272,5 +272,18 @@ async fn view(
         encoder.write_header()?.write_image_data(&frame.rgba)?;
         println!("Tela remota salva em {}", path.display());
     }
+    // Despede-se do host em vez de simplesmente sumir, para ele liberar a
+    // sessão na hora.
+    drop(frame);
+    viewer.disconnect();
+    let _ = tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(event) = events.recv().await {
+            if matches!(event, ViewerEvent::Closed(_)) {
+                break;
+            }
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     Ok(())
 }

@@ -39,6 +39,8 @@ impl SharedFrame {
 const PUNCH_FOR: Duration = Duration::from_secs(8);
 /// Limite para a corrida entre os endereços candidatos do host.
 const CONNECT_LIMIT: Duration = Duration::from_secs(10);
+/// Com um relay de reserva, a tentativa direta desiste mais cedo.
+const DIRECT_LIMIT_WITH_RELAY: Duration = Duration::from_secs(4);
 
 /// Para onde conectar.
 #[derive(Clone)]
@@ -54,6 +56,8 @@ pub struct Lookup {
     pub rendezvous: Rendezvous,
     pub stun_servers: Vec<String>,
     pub known: KnownHosts,
+    /// Relay próprio (`host:porta`), usado se a conexão direta falhar.
+    pub relay: Option<String>,
 }
 
 impl Lookup {
@@ -66,6 +70,7 @@ impl Lookup {
             rendezvous: Rendezvous::new(&url)?,
             stun_servers: opendesk_net::DEFAULT_STUN_SERVERS.iter().map(|s| s.to_string()).collect(),
             known: KnownHosts::load(data_dir),
+            relay: opendesk_net::relay_addr(),
         })))
     }
 }
@@ -80,6 +85,9 @@ pub enum Route {
     Lan,
     /// Encontrado por ID, atravessando a internet (NAT perfurado).
     Internet,
+    /// Encontrado por ID, mas sem caminho direto: os pacotes, ainda cifrados
+    /// de ponta a ponta, passam por um relay.
+    Relay,
 }
 
 impl Route {
@@ -88,6 +96,7 @@ impl Route {
             Route::Address => "Direta, por endereço",
             Route::Lan => "Direta, rede local",
             Route::Internet => "Direta, ponto a ponto",
+            Route::Relay => "Via relay",
         }
     }
 }
@@ -215,7 +224,11 @@ impl Task {
         };
 
         let (mine, _) = self.node.candidates(&lookup.stun_servers).await;
-        let answer = lookup.rendezvous.dial(id, self.node.identity().fingerprint(), &mine).await?;
+        let my_relay = match &lookup.relay {
+            Some(relay) => opendesk_net::rendezvous::resolve_relay(relay).await,
+            None => None,
+        };
+        let answer = lookup.rendezvous.dial(id, self.node.identity().fingerprint(), &mine, my_relay).await?;
 
         // Primeiro contato fixa a identidade; depois disso ela não pode mudar.
         let pinned = lookup.known.get(id);
@@ -230,31 +243,58 @@ impl Task {
                 answer.fingerprint.short()
             );
         }
-        if answer.candidates.is_empty() {
+        // O relay, se houver, fica pronto desde já: os dois lados se
+        // apresentam a ele enquanto a conexão direta é tentada.
+        let relayed = answer.relay.map(|(relay, token)| self.node.relay_route(relay, token));
+        if answer.candidates.is_empty() && relayed.is_none() {
             bail!("O computador remoto não informou nenhum endereço para conexão.");
         }
 
-        self.node.punch(&answer.candidates, PUNCH_FOR);
-        let (peer, addr) =
-            self.node.connect_any(&answer.candidates, Some(answer.fingerprint), CONNECT_LIMIT).await.map_err(
-                |err| {
-                    tracing::debug!("conexão direta com {id} falhou: {err:#}");
-                    anyhow!(
-                        "Não foi possível abrir uma conexão direta com esse computador. \
-                     A rede de um dos lados bloqueia conexões ponto a ponto, e o relay ainda não está disponível."
-                    )
-                },
-            )?;
+        // `OPENDESK_FORCE_RELAY=1` pula a tentativa direta (diagnóstico).
+        let force_relay = std::env::var_os("OPENDESK_FORCE_RELAY").is_some() && relayed.is_some();
+        let direct = if force_relay || answer.candidates.is_empty() {
+            Err(anyhow!("tentativa direta não realizada"))
+        } else {
+            self.node.punch(&answer.candidates, PUNCH_FOR);
+            let limit = if relayed.is_some() { DIRECT_LIMIT_WITH_RELAY } else { CONNECT_LIMIT };
+            self.node.connect_any(&answer.candidates, Some(answer.fingerprint), limit).await
+        };
+
+        let (peer, route) = match (direct, relayed) {
+            (Ok((peer, addr)), _) => {
+                let local = match addr.ip() {
+                    IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+                    IpAddr::V6(ip) => ip.is_loopback(),
+                };
+                (peer, if local { Route::Lan } else { Route::Internet })
+            }
+            (Err(direct_err), Some(virtual_addr)) => {
+                tracing::debug!("conexão direta com {id} falhou ({direct_err:#}); tentando pelo relay");
+                let via_relay = self.node.connect(virtual_addr, Some(answer.fingerprint));
+                match tokio::time::timeout(CONNECT_LIMIT, via_relay).await {
+                    Ok(Ok(peer)) => (peer, Route::Relay),
+                    Ok(Err(err)) => {
+                        tracing::debug!("conexão por relay com {id} falhou: {err:#}");
+                        bail!("Não foi possível conectar a esse computador, nem direto nem pelo relay.");
+                    }
+                    Err(_) => bail!("Não foi possível conectar a esse computador: nem direto, nem o relay respondeu."),
+                }
+            }
+            (Err(err), None) => {
+                tracing::debug!("conexão direta com {id} falhou: {err:#}");
+                bail!(
+                    "Não foi possível abrir uma conexão direta com esse computador. \
+                     A rede de um dos lados bloqueia conexões ponto a ponto. \
+                     Com um relay configurado em um dos dois (OPENDESK_RELAY), a conexão passa por ele."
+                );
+            }
+        };
         if pinned.is_none()
             && let Err(err) = lookup.known.remember(id, peer.fingerprint)
         {
             tracing::warn!("não foi possível guardar a identidade de {id}: {err}");
         }
-        let local = match addr.ip() {
-            IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
-            IpAddr::V6(ip) => ip.is_loopback(),
-        };
-        Ok((peer, if local { Route::Lan } else { Route::Internet }))
+        Ok((peer, route))
     }
 
     async fn run(&self, mut commands: mpsc::UnboundedReceiver<Command>) -> Result<String> {
@@ -294,6 +334,9 @@ impl Task {
                     DenyReason::Timeout => "Ninguém respondeu ao pedido de conexão.",
                     DenyReason::VersionMismatch => "As versões do OpenDesk nos dois lados são incompatíveis.",
                     DenyReason::CaptureUnavailable => "O computador remoto não conseguiu capturar a tela.",
+                    DenyReason::Busy => {
+                        "O computador remoto já está em outra sessão. Tente de novo quando ela terminar."
+                    }
                 }
                 .into());
             }

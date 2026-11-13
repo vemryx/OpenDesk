@@ -256,6 +256,31 @@ impl Node {
         (list, public.nat)
     }
 
+    /// Prepara o caminho por um relay para a sessão `token` e devolve o
+    /// endereço (virtual) a usar para alcançar o par por ele: conectar nesse
+    /// endereço, ou aceitar uma conexão vinda dele, passa pelo relay sem que o
+    /// QUIC perceba. Também se apresenta ao relay por alguns segundos, para
+    /// ele saber para onde repassar.
+    pub fn relay_route(&self, relay: SocketAddr, token: opendesk_proto::relay::Token) -> SocketAddr {
+        let virtual_addr = self.socket.add_route(relay, token);
+        let socket = self.socket.clone();
+        let hello = opendesk_proto::relay::wrap(&token, &[]);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(200));
+            for _ in 0..25 {
+                tick.tick().await;
+                socket.send_raw(relay, &hello);
+            }
+        });
+        virtual_addr
+    }
+
+    /// Se `addr` é o endereço virtual de um par alcançado por relay, o
+    /// endereço real do relay.
+    pub fn via_relay(&self, addr: SocketAddr) -> Option<SocketAddr> {
+        self.socket.relay_of(addr)
+    }
+
     /// Envia pacotes vazios de sentido para `targets` por `duration`, só para
     /// o roteador abrir o caminho de volta para eles.
     pub fn punch(&self, targets: &[SocketAddr], duration: Duration) {
@@ -456,6 +481,56 @@ mod tests {
         // A conexão continua de pé depois da rajada de perfuração.
         tokio::time::sleep(Duration::from_millis(700)).await;
         assert!(peer.conn.close_reason().is_none());
+    }
+
+    /// Dois nós que só se alcançam por um relay: o QUIC inteiro (handshake
+    /// com autenticação mútua e dados) atravessa o envelope, nos dois sentidos.
+    #[tokio::test]
+    async fn peers_connect_through_a_relay_and_exchange_data() {
+        let relay_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_socket.local_addr().unwrap();
+        tokio::spawn(opendesk_relay::serve(relay_socket, opendesk_relay::Config::default()));
+
+        let (host, viewer) = (node(), node());
+        let (host_fp, viewer_fp) = (host.identity().fingerprint(), viewer.identity().fingerprint());
+        let token = [42u8; opendesk_proto::relay::TOKEN_LEN];
+        let host_side = host.relay_route(relay_addr, token);
+        let viewer_side = viewer.relay_route(relay_addr, token);
+        assert_eq!(host.via_relay(host_side), Some(relay_addr));
+        assert_eq!(host.via_relay(relay_addr), None);
+        // Pedir a mesma rota de novo devolve o mesmo endereço virtual.
+        assert_eq!(viewer.relay_route(relay_addr, token), viewer_side);
+
+        let server = tokio::spawn(async move {
+            let peer = host.accept().await.unwrap().unwrap();
+            // Para o host, o par "mora" no endereço virtual da rota.
+            assert_eq!(peer.conn.remote_address(), host_side);
+            let (mut tx, mut rx) = peer.conn.accept_bi().await.unwrap();
+            let got = read_frame(&mut rx, 1 << 20).await.unwrap();
+            write_frame(&mut tx, &got).await.unwrap();
+            tx.finish().unwrap();
+            peer.conn.closed().await;
+            peer.fingerprint
+        });
+
+        let peer = viewer.connect(viewer_side, Some(host_fp)).await.unwrap();
+        // Grande o bastante para ocupar muitos pacotes e envios agrupados.
+        let payload: Vec<u8> = (0..300_000u32).map(|i| (i * 31 % 251) as u8).collect();
+        let (mut tx, mut rx) = peer.conn.open_bi().await.unwrap();
+        write_frame(&mut tx, &payload).await.unwrap();
+        assert_eq!(read_frame(&mut rx, 1 << 20).await.unwrap(), payload);
+        peer.conn.close(0u32.into(), b"fim");
+        assert_eq!(server.await.unwrap(), viewer_fp);
+    }
+
+    /// Um relay que não repassa nada não pode travar a conexão para sempre.
+    #[tokio::test]
+    async fn relay_route_to_a_dead_relay_just_fails() {
+        let viewer = node();
+        let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let virtual_addr = viewer.relay_route(dead, [1; opendesk_proto::relay::TOKEN_LEN]);
+        let attempt = viewer.connect_any(&[virtual_addr], None, Duration::from_millis(500)).await;
+        assert!(attempt.is_err());
     }
 
     #[tokio::test]

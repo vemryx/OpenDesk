@@ -2550,6 +2550,7 @@ dependencies = [
  "anyhow",
  "futures-util",
  "opendesk-proto",
+ "opendesk-relay",
  "quinn",
  "rcgen",
  "ring",
@@ -2582,6 +2583,18 @@ dependencies = [
  "serde",
  "thiserror 2.0.21",
  "tokio",
+]
+
+[[package]]
+name = "opendesk-relay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "opendesk-proto",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

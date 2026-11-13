@@ -15,6 +15,7 @@ opendesk-codec = { path = "crates/opendesk-codec" }
 opendesk-net = { path = "crates/opendesk-net" }
 opendesk-platform = { path = "crates/opendesk-platform" }
 opendesk-session = { path = "crates/opendesk-session" }
+opendesk-relay = { path = "crates/opendesk-relay" }
 
 anyhow = "1"
 thiserror = "2"

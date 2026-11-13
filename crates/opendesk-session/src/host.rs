@@ -27,6 +27,8 @@ pub struct PeerInfo {
     pub name: String,
     pub fingerprint: Fingerprint,
     pub addr: SocketAddr,
+    /// Preenchido quando a conexão chega por um relay (e `addr` é virtual).
+    pub relay: Option<SocketAddr>,
     pub wants: Permissions,
 }
 
@@ -58,6 +60,10 @@ pub struct Host {
     wake: Wake,
     connections: Mutex<HashMap<u64, quinn::Connection>>,
     next_session: AtomicU64,
+    /// Há uma sessão transmitindo a tela. O Windows só permite uma captura
+    /// por processo, então por enquanto o host atende um visualizador por
+    /// vez; vários ao mesmo tempo exigem compartilhar a captura (roteiro).
+    streaming: Arc<AtomicBool>,
 }
 
 impl Host {
@@ -76,6 +82,7 @@ impl Host {
             wake,
             connections: Mutex::new(HashMap::new()),
             next_session: AtomicU64::new(1),
+            streaming: Arc::new(AtomicBool::new(false)),
         };
         (Arc::new(host), receiver)
     }
@@ -152,6 +159,12 @@ impl Host {
             bail!("versão de protocolo incompatível ({} ≠ {PROTOCOL_VERSION})", hello.protocol);
         }
 
+        // Ocupado: nem incomoda a pessoa com um pedido que não pode atender.
+        if self.streaming.load(Ordering::Acquire) {
+            deny(&mut tx, conn, DenyReason::Busy).await;
+            bail!("já há uma sessão em andamento");
+        }
+
         // Nomes vêm da rede e vão parar na tela de autorização: limita o
         // tamanho e tira caracteres de controle.
         let name: String = hello.device_name.chars().filter(|c| !c.is_control()).take(64).collect();
@@ -159,6 +172,7 @@ impl Host {
             name: if name.trim().is_empty() { "(sem nome)".into() } else { name },
             fingerprint: peer.fingerprint,
             addr: conn.remote_address(),
+            relay: self.node.via_relay(conn.remote_address()),
             wants: hello.wants,
         };
 
@@ -180,6 +194,13 @@ impl Host {
             },
             closed = conn.closed() => return Ok(describe_close(&closed)),
         };
+
+        // Dois pedidos aprovados ao mesmo tempo: só o primeiro leva.
+        if self.streaming.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            deny(&mut tx, conn, DenyReason::Busy).await;
+            return Ok("Já havia outra sessão em andamento.".into());
+        }
+        let _free_on_exit = ClearOnDrop(self.streaming.clone());
 
         // Sobe a captura antes de responder, para já informar a resolução.
         let stop = Arc::new(AtomicBool::new(false));
@@ -248,6 +269,14 @@ impl Host {
         };
         sink.release_all();
         Ok(reason)
+    }
+}
+
+struct ClearOnDrop(Arc<AtomicBool>);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 

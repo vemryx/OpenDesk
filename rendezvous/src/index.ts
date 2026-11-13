@@ -50,6 +50,20 @@ type Attachment =
   | { role: "host"; fingerprint: string }
   | { role: "dial"; session: string; at: number; offered: boolean };
 
+/** Relay sugerido pelo visualizador: só um endereço. */
+function relayAddr(value: unknown): string | null {
+  return typeof value === "string" && CANDIDATE.test(value) ? value : null;
+}
+
+/** Relay escolhido pelo host: endereço e token de sessão (16 bytes em hex). */
+function relayChoice(value: unknown): { addr: string; token: string } | null {
+  if (typeof value !== "object" || value === null) return null;
+  const { addr, token } = value as Record<string, unknown>;
+  if (typeof addr !== "string" || !CANDIDATE.test(addr)) return null;
+  if (typeof token !== "string" || !/^[0-9a-f]{32}$/.test(token)) return null;
+  return { addr, token };
+}
+
 function candidates(value: unknown): string[] | null {
   if (!Array.isArray(value) || value.length === 0 || value.length > MAX_CANDIDATES) return null;
   return value.every((c) => typeof c === "string" && CANDIDATE.test(c)) ? (value as string[]) : null;
@@ -169,7 +183,15 @@ export class Device extends DurableObject<Env> {
     this.offers.push(now);
 
     ws.serializeAttachment({ ...state, offered: true } satisfies Attachment);
-    host.send(JSON.stringify({ t: "offer", session: state.session, fingerprint: message.fingerprint, candidates: list }));
+    host.send(
+      JSON.stringify({
+        t: "offer",
+        session: state.session,
+        fingerprint: message.fingerprint,
+        candidates: list,
+        relay: relayAddr(message.relay),
+      }),
+    );
   }
 
   private answer(state: Extract<Attachment, { role: "host" }>, message: Record<string, unknown>): void {
@@ -180,7 +202,10 @@ export class Device extends DurableObject<Env> {
       if (dial?.role === "dial" && dial.offered && dial.session === message.session) {
         // A impressão digital vem do registro verificado, não do que o host
         // disser agora.
-        ws.send(JSON.stringify({ t: "answer", fingerprint: state.fingerprint, candidates: list }));
+        // O relay é só repassado: o token que o host sorteou serve para os
+        // dois lados se acharem lá, e não dá acesso à sessão, que é cifrada.
+        const relay = relayChoice(message.relay);
+        ws.send(JSON.stringify({ t: "answer", fingerprint: state.fingerprint, candidates: list, relay }));
         this.close(ws, "done");
       }
     }

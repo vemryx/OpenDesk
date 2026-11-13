@@ -35,10 +35,11 @@ use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 /// qualquer site veria, e nada mais.
 pub const DEFAULT_STUN_SERVERS: [&str; 2] = ["stun.cloudflare.com:3478", "stun.l.google.com:19302"];
 
-/// Servidor de encontro usado quando nenhum outro é configurado. Ainda não há
-/// um servidor público do projeto; até lá, a conexão por ID exige apontar para
-/// um servidor próprio com a variável `OPENDESK_RENDEZVOUS`.
-pub const DEFAULT_RENDEZVOUS: Option<&str> = None;
+/// Servidor de encontro usado quando nenhum outro é configurado. É uma
+/// instância do Worker em `rendezvous/`, no plano gratuito da Cloudflare,
+/// mantida pelo projeto. Quem preferir pode publicar a sua e apontar para ela
+/// com a variável `OPENDESK_RENDEZVOUS`.
+pub const DEFAULT_RENDEZVOUS: Option<&str> = Some("wss://opendesk-rendezvous.felipemarquesini10.workers.dev");
 
 /// Endereço do servidor de encontro a usar: o da variável de ambiente
 /// `OPENDESK_RENDEZVOUS`, senão o padrão. `OPENDESK_RENDEZVOUS=off` desliga.
@@ -48,6 +49,12 @@ pub fn rendezvous_url() -> Option<String> {
         Ok(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
         _ => DEFAULT_RENDEZVOUS.map(str::to_string),
     }
+}
+
+/// Relay a usar quando a conexão direta falha: `host:porta` na variável de
+/// ambiente `OPENDESK_RELAY`. Não há relay padrão; ver `crates/opendesk-relay`.
+pub fn relay_addr() -> Option<String> {
+    std::env::var("OPENDESK_RELAY").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
 /// IP local pelo qual este computador sai para a rede. Um socket UDP

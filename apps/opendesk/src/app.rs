@@ -149,7 +149,7 @@ impl App {
                     *presence.lock().unwrap() = now;
                     wake();
                 };
-                lookup.rendezvous.serve(node, servers, update).await;
+                lookup.rendezvous.serve(node, servers, lookup.relay.clone(), update).await;
             });
         }
 
@@ -656,7 +656,11 @@ impl App {
             egui::Grid::new("request").num_columns(2).spacing([18.0, 6.0]).min_row_height(22.0).show(ui, |ui| {
                 theme::detail(ui, p, "ID do dispositivo", &peer.fingerprint.device_id().to_string());
                 theme::detail(ui, p, "Impressão digital", &peer.fingerprint.short());
-                theme::detail(ui, p, "Endereço de rede", &peer.addr.to_string());
+                let network = match peer.relay {
+                    Some(relay) => format!("via relay {relay}"),
+                    None => peer.addr.to_string(),
+                };
+                theme::detail(ui, p, "Endereço de rede", &network);
             });
             ui.add_space(4.0);
             egui::Frame::new()
@@ -722,9 +726,16 @@ impl App {
                             Some(rtt) => format!(" · {} ms", rtt.as_millis()),
                             None => String::new(),
                         };
-                        ui.label(theme::muted(format!("{}{latency}", route.label()), p).small()).on_hover_text(
-                            "A sessão vai direto de um computador ao outro, cifrada de ponta a ponta. Nenhum servidor vê a tela.",
-                        );
+                        let explanation = match route {
+                            Route::Relay => {
+                                "Não houve caminho direto, então os pacotes passam por um relay. Eles continuam cifrados de ponta a ponta: o relay não vê a tela."
+                            }
+                            _ => {
+                                "A sessão vai direto de um computador ao outro, cifrada de ponta a ponta. Nenhum servidor vê a tela."
+                            }
+                        };
+                        ui.label(theme::muted(format!("{}{latency}", route.label()), p).small())
+                            .on_hover_text(explanation);
                     }
                     let roomy = ui.available_width() > 620.0;
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

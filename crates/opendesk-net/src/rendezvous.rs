@@ -13,6 +13,8 @@ use crate::identity::{DeviceId, Fingerprint, Identity};
 use crate::node::{Nat, Node};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
+use opendesk_proto::relay::{self, Token};
+use ring::rand::SecureRandom as _;
 use serde::Deserialize;
 use serde_json::json;
 use std::net::SocketAddr;
@@ -56,6 +58,14 @@ pub struct Answer {
     /// Impressão digital com que o host se registrou no servidor.
     pub fingerprint: Fingerprint,
     pub candidates: Vec<SocketAddr>,
+    /// Relay combinado para esta sessão, caso a conexão direta falhe.
+    pub relay: Option<(SocketAddr, Token)>,
+}
+
+#[derive(Deserialize)]
+struct RelayInfo {
+    addr: String,
+    token: String,
 }
 
 #[derive(Debug, Error)]
@@ -73,11 +83,26 @@ pub enum DialError {
 #[derive(Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum ServerMsg {
-    Challenge { nonce: String },
+    Challenge {
+        nonce: String,
+    },
     Registered {},
-    Offer { session: String, candidates: Vec<String> },
-    Answer { fingerprint: String, candidates: Vec<String> },
-    Error { code: String },
+    Offer {
+        session: String,
+        candidates: Vec<String>,
+        /// Relay que o visualizador sugere, se o host não tiver o seu.
+        #[serde(default)]
+        relay: Option<String>,
+    },
+    Answer {
+        fingerprint: String,
+        candidates: Vec<String>,
+        #[serde(default)]
+        relay: Option<RelayInfo>,
+    },
+    Error {
+        code: String,
+    },
 }
 
 pub struct Rendezvous {
@@ -113,23 +138,34 @@ impl Rendezvous {
     }
 
     /// Pede ao dono de `id` os endereços dele, entregando os nossos.
-    pub async fn dial(&self, id: DeviceId, me: Fingerprint, candidates: &[SocketAddr]) -> Result<Answer, DialError> {
+    pub async fn dial(
+        &self,
+        id: DeviceId,
+        me: Fingerprint,
+        candidates: &[SocketAddr],
+        relay: Option<SocketAddr>,
+    ) -> Result<Answer, DialError> {
         let server = |err: anyhow::Error| DialError::Server(format!("{err:#}"));
         let mut ws = self.open(&format!("/v1/dial/{}", id.0)).await.map_err(server)?;
         let offer = json!({
             "t": "offer",
             "fingerprint": me.hex(),
             "candidates": candidates.iter().map(SocketAddr::to_string).collect::<Vec<_>>(),
+            "relay": relay.map(|addr| addr.to_string()),
         });
         // Se o host estiver offline o servidor já respondeu e fechou; o erro
         // que interessa é o que vier na leitura.
         let _ = ws.send(Message::text(offer.to_string())).await;
 
         match next(&mut ws, ANSWER_TIMEOUT).await {
-            Ok(ServerMsg::Answer { fingerprint, candidates }) => {
+            Ok(ServerMsg::Answer { fingerprint, candidates, relay }) => {
                 let fingerprint = Fingerprint::from_hex(&fingerprint)
                     .ok_or_else(|| DialError::Server("resposta com impressão digital inválida".into()))?;
-                Ok(Answer { fingerprint, candidates: parse_candidates(&candidates) })
+                let relay = relay.and_then(|info| {
+                    let addr = parse_candidates(std::slice::from_ref(&info.addr)).pop()?;
+                    Some((addr, relay::token_from_hex(&info.token)?))
+                });
+                Ok(Answer { fingerprint, candidates: parse_candidates(&candidates), relay })
             }
             Ok(ServerMsg::Error { code }) => Err(match code.as_str() {
                 "offline" => DialError::Offline,
@@ -145,13 +181,19 @@ impl Rendezvous {
     /// Mantém este dispositivo registrado e respondendo a pedidos, para
     /// sempre: se a conexão com o servidor cair, tenta de novo com espera
     /// crescente. `status` é chamado a cada mudança de situação.
-    pub async fn serve(&self, node: Arc<Node>, stun_servers: Vec<String>, status: impl Fn(Presence)) {
+    pub async fn serve(
+        &self,
+        node: Arc<Node>,
+        stun_servers: Vec<String>,
+        relay: Option<String>,
+        status: impl Fn(Presence),
+    ) {
         let mut wait = RETRY_MIN;
         status(Presence::Connecting);
         loop {
             let mut was_online = false;
             let err = self
-                .session(&node, &stun_servers, |presence| {
+                .session(&node, &stun_servers, relay.as_deref(), |presence| {
                     was_online = true;
                     status(presence);
                 })
@@ -167,7 +209,13 @@ impl Rendezvous {
     }
 
     /// Uma conexão com o servidor, do registro até cair.
-    async fn session(&self, node: &Node, stun_servers: &[String], mut online: impl FnMut(Presence)) -> anyhow::Error {
+    async fn session(
+        &self,
+        node: &Node,
+        stun_servers: &[String],
+        own_relay: Option<&str>,
+        mut online: impl FnMut(Presence),
+    ) -> anyhow::Error {
         let (mut ws, id) = match self.register(node.identity()).await {
             Ok(registered) => registered,
             Err(err) => return err,
@@ -196,15 +244,28 @@ impl Rendezvous {
                 continue;
             }
             match serde_json::from_str::<ServerMsg>(text.as_str()) {
-                Ok(ServerMsg::Offer { session, candidates }) => {
+                Ok(ServerMsg::Offer { session, candidates, relay: offered }) => {
                     // Abre o caminho antes de responder, para o buraco já
                     // existir quando o visualizador começar a tentar.
                     node.punch(&parse_candidates(&candidates), PUNCH_FOR);
                     let (mine, _) = node.candidates(stun_servers).await;
+                    // Relay de reserva: o deste host, senão o que o
+                    // visualizador sugeriu. O token é sempre sorteado aqui.
+                    let relay_addr = match own_relay {
+                        Some(own) => resolve_relay(own).await,
+                        None => offered.and_then(|addr| parse_candidates(&[addr]).pop()),
+                    };
+                    let relay_info = relay_addr.and_then(|addr| {
+                        let mut token: Token = [0; relay::TOKEN_LEN];
+                        ring::rand::SystemRandom::new().fill(&mut token).ok()?;
+                        node.relay_route(addr, token);
+                        Some(json!({ "addr": addr.to_string(), "token": relay::token_to_hex(&token) }))
+                    });
                     let answer = json!({
                         "t": "answer",
                         "session": session,
                         "candidates": mine.iter().map(SocketAddr::to_string).collect::<Vec<_>>(),
+                        "relay": relay_info,
                     });
                     if let Err(err) = ws.send(Message::text(answer.to_string())).await {
                         return anyhow!(err).context("a conexão com o servidor caiu");
@@ -275,6 +336,17 @@ async fn next(ws: &mut Socket, limit: Duration) -> Result<ServerMsg> {
     timeout(limit, read).await.map_err(|_| anyhow!("o servidor de encontro demorou demais"))?
 }
 
+/// Resolve `host:porta` (ou só `host`, na porta padrão) de um relay para IPv4.
+pub async fn resolve_relay(relay: &str) -> Option<SocketAddr> {
+    let target = if relay.contains(':') {
+        relay.to_string()
+    } else {
+        format!("{relay}:{}", opendesk_proto::relay::DEFAULT_PORT)
+    };
+    let mut addrs = timeout(Duration::from_secs(2), tokio::net::lookup_host(target)).await.ok()?.ok()?;
+    addrs.find(SocketAddr::is_ipv4)
+}
+
 /// Endereços vindos da rede: o que não for `ip:porta` IPv4 utilizável é
 /// descartado em silêncio.
 fn parse_candidates(list: &[String]) -> Vec<SocketAddr> {
@@ -313,7 +385,12 @@ mod tests {
         let offer: ServerMsg =
             serde_json::from_str(r#"{"t":"offer","session":"ab","fingerprint":"00","candidates":["1.2.3.4:5"]}"#)
                 .unwrap();
-        assert!(matches!(offer, ServerMsg::Offer { session, .. } if session == "ab"));
+        assert!(matches!(offer, ServerMsg::Offer { session, relay: None, .. } if session == "ab"));
+        let answer: ServerMsg = serde_json::from_str(
+            r#"{"t":"answer","fingerprint":"00","candidates":[],"relay":{"addr":"1.2.3.4:47800","token":"00"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(answer, ServerMsg::Answer { relay: Some(info), .. } if info.addr == "1.2.3.4:47800"));
         let registered: ServerMsg = serde_json::from_str(r#"{"t":"registered","id":"123456789"}"#).unwrap();
         assert!(matches!(registered, ServerMsg::Registered {}));
         assert!(serde_json::from_str::<ServerMsg>(r#"{"t":"desconhecida"}"#).is_err());

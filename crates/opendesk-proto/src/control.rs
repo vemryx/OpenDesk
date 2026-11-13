@@ -46,6 +46,8 @@ pub enum DenyReason {
     VersionMismatch,
     /// O host não conseguiu capturar a tela.
     CaptureUnavailable,
+    /// O host já está em outra sessão.
+    Busy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
