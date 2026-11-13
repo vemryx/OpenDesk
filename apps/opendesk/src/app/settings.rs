@@ -183,6 +183,16 @@ impl App {
         theme::setting(
             ui,
             p,
+            "Permitir transferência de arquivos",
+            "Durante um acesso com controle, quem acessa pode enviar arquivos para cá e receber os que forem enviados daqui. O que chega fica em Downloads, na pasta OpenDesk.",
+            |ui| {
+                changed |=
+                    theme::toggle(ui, p, &mut settings.allow_files, "Permitir transferência de arquivos").changed();
+            },
+        );
+        theme::setting(
+            ui,
+            p,
             "Acesso não supervisionado",
             "Quem souber a senha de acesso entra neste computador sem ninguém aprovar. Ligue só em computadores seus, com uma senha longa que você não usa em nenhum outro lugar.",
             |ui| changed |= theme::toggle(ui, p, &mut settings.unattended, "Acesso não supervisionado").changed(),
@@ -355,7 +365,12 @@ impl App {
             egui::Grid::new("historico").num_columns(4).spacing([18.0, 8.0]).min_row_height(18.0).show(ui, |ui| {
                 for entry in &self.history_view {
                     ui.label(theme::muted(config::short_when(&entry.when), p));
-                    ui.label(theme::muted(if entry.incoming { "Recebida" } else { "Feita" }, p));
+                    let what = match (entry.kind, entry.incoming) {
+                        (config::Kind::File, _) => "Arquivo",
+                        (_, true) => "Recebida",
+                        (_, false) => "Feita",
+                    };
+                    ui.label(theme::muted(what, p));
                     ui.label(RichText::new(format!("{}  {}", entry.name, entry.id)).color(p.text));
                     ui.label(theme::muted(entry.summary(), p));
                     ui.end_row();
@@ -371,17 +386,44 @@ impl App {
     }
 
     fn about(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        let fingerprint = self.identity().fingerprint();
-        egui::Grid::new("sobre").num_columns(2).spacing([18.0, 8.0]).min_row_height(18.0).show(ui, |ui| {
-            theme::detail(ui, p, "Versão", env!("CARGO_PKG_VERSION"));
-            theme::detail(ui, p, "Licença", "Apache-2.0, código aberto");
-            ui.label(theme::muted("Código-fonte", p));
-            ui.hyperlink_to("github.com/vemryx/OpenDesk", "https://github.com/vemryx/OpenDesk");
-            ui.end_row();
-            theme::detail(ui, p, "ID deste dispositivo", &fingerprint.device_id().to_string());
-            theme::detail(ui, p, "Impressão digital", &fingerprint.short());
+        // A marca abre a aba, com o que o programa é e a versão.
+        ui.spacing_mut().item_spacing.y = 6.0;
+        ui.add_space(4.0);
+        self.logo.show(ui, p, 34.0);
+        ui.add_space(4.0);
+        ui.label(RichText::new("Acesso remoto ponto a ponto, gratuito e de código aberto.").color(p.text));
+        ui.label(theme::muted(concat!("Versão ", env!("CARGO_PKG_VERSION"), ", licença Apache-2.0"), p).small());
+        ui.add_space(14.0);
+
+        ui.spacing_mut().item_spacing.y = 18.0;
+        let mut open = None;
+        theme::setting(ui, p, "Feito pela Vemryx", "O OpenDesk é desenvolvido e mantido pela Vemryx.", |ui| {
+            if ui.button("vemryx.com").on_hover_text("Abrir o site da Vemryx no navegador").clicked() {
+                open = Some("https://vemryx.com");
+            }
         });
-        if ui.button("Abrir a pasta de dados").on_hover_text(self.data_dir.display().to_string()).clicked() {
+        theme::setting(
+            ui,
+            p,
+            "Código aberto",
+            "Todo o código está no GitHub: dá para ler, auditar, compilar e contribuir.",
+            |ui| {
+                if ui.button("Ver no GitHub").on_hover_text("github.com/vemryx/OpenDesk").clicked() {
+                    open = Some("https://github.com/vemryx/OpenDesk");
+                }
+            },
+        );
+        let fingerprint = self.identity().fingerprint();
+        let device = format!("ID {}, impressão digital {}", fingerprint.device_id(), fingerprint.short());
+        let mut open_data = false;
+        theme::setting(ui, p, "Este dispositivo", &device, |ui| {
+            open_data =
+                ui.button("Abrir a pasta de dados").on_hover_text(self.data_dir.display().to_string()).clicked();
+        });
+        if let Some(url) = open {
+            self.open_external(std::ffi::OsStr::new(url));
+        }
+        if open_data {
             self.open_data_dir();
         }
     }
@@ -446,9 +488,6 @@ impl App {
     }
 
     fn open_data_dir(&mut self) {
-        let opener = if cfg!(windows) { "explorer" } else { "xdg-open" };
-        if let Err(err) = std::process::Command::new(opener).arg(&self.data_dir).spawn() {
-            self.settings_problem = Some(format!("Não foi possível abrir a pasta: {err}."));
-        }
+        self.open_external(self.data_dir.clone().as_os_str());
     }
 }

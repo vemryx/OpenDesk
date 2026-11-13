@@ -21,6 +21,7 @@ use opendesk_proto::control::{InputEvent, MouseButton, Permissions};
 use opendesk_session::Wake;
 use opendesk_session::auth::PasswordAccess;
 use opendesk_session::backend::{Clipboard as _, SystemBackend, SystemClipboard};
+use opendesk_session::files::{FileEvent, FileState};
 use opendesk_session::host::{Host, HostEvent, PeerInfo, Unattended};
 use opendesk_session::viewer::{InputSender, Lookup, Route, Target, Viewer, ViewerEvent};
 use std::collections::HashSet;
@@ -116,6 +117,13 @@ pub struct App {
     copied_at: Option<Instant>,
     /// A janela foi maximizada pelo app ao entrar na sessão (e não pela pessoa).
     maximized_for_session: bool,
+    /// Arquivos em andamento ou recém-terminados, das duas direções.
+    transfers: Vec<Transfer>,
+    /// Um seletor de arquivos aberto: para qual sessão é e por onde chega a
+    /// escolha. Roda numa thread própria para não travar a interface.
+    picker: Option<(Option<u64>, std::sync::mpsc::Receiver<Vec<PathBuf>>)>,
+    /// Onde ficam os arquivos recebidos.
+    files_dir: PathBuf,
     /// A sessão está em tela cheia; a barra só aparece com o ponteiro no topo.
     fullscreen: bool,
     bar_until: Option<Instant>,
@@ -142,6 +150,47 @@ struct Inbound {
     since: Instant,
     /// Entrou pela senha de acesso não supervisionado.
     by_password: bool,
+}
+
+/// Um arquivo sendo trocado numa sessão.
+struct Transfer {
+    /// A sessão de entrada a que pertence; `None` é a sessão em que este
+    /// computador acessa outro.
+    session: Option<u64>,
+    /// Com quem é a troca.
+    peer: String,
+    event: FileEvent,
+    updated: Instant,
+}
+
+impl Transfer {
+    fn finished(&self) -> bool {
+        matches!(self.event.state, FileState::Done(_) | FileState::Refused | FileState::Failed(_))
+    }
+
+    /// O que dizer sobre este arquivo, numa linha.
+    fn describe(&self) -> String {
+        let (name, event) = (&self.event.name, &self.event);
+        let percent = |done: &u64| done.saturating_mul(100).checked_div(event.size).unwrap_or(100);
+        match (&event.state, event.incoming) {
+            (FileState::Offered, _) => {
+                format!("{} quer enviar {name} ({})", self.peer, crate::config::file_size(event.size))
+            }
+            (FileState::Progress(done), true) => format!("Recebendo {name}, {}%", percent(done)),
+            (FileState::Progress(done), false) => format!("Enviando {name}, {}%", percent(done)),
+            (FileState::Done(_), true) => format!("Recebido: {name}"),
+            (FileState::Done(_), false) => format!("Enviado: {name}"),
+            (FileState::Refused, true) => format!("{name}: recusado"),
+            (FileState::Refused, false) => format!("{name}: {} não aceitou o arquivo", self.peer),
+            (FileState::Failed(why), _) => format!("{name}: {why}"),
+        }
+    }
+}
+
+/// O que a pessoa pediu numa linha de transferência.
+enum TransferAction {
+    Answer(u64, bool),
+    OpenFolder,
 }
 
 /// Como está a tentativa de entrar com a senha do computador remoto.
@@ -268,6 +317,15 @@ impl App {
             }
         };
 
+        // Arquivos recebidos vão para Downloads\OpenDesk (`OPENDESK_FILES_DIR`
+        // troca a pasta, para testes e implantações).
+        let files_dir: PathBuf = std::env::var_os("OPENDESK_FILES_DIR").map(PathBuf::from).unwrap_or_else(|| {
+            directories::UserDirs::new()
+                .and_then(|dirs| dirs.download_dir().map(|downloads| downloads.join("OpenDesk")))
+                .unwrap_or_else(|| data_dir.join("Recebidos"))
+        });
+        host.set_files_dir(Some(files_dir.clone()));
+
         let mut app = Self {
             runtime,
             node,
@@ -302,6 +360,9 @@ impl App {
             notice: None,
             copied_at: None,
             maximized_for_session: false,
+            transfers: Vec::new(),
+            picker: None,
+            files_dir: files_dir.clone(),
             fullscreen: false,
             bar_until: None,
             quiet: std::env::var_os("OPENDESK_WINDOW_POS").is_some(),
@@ -352,6 +413,146 @@ impl App {
         }));
     }
 
+    /// Atualiza a lista de transferências com uma novidade, e põe no histórico
+    /// os arquivos que terminaram.
+    fn track(&mut self, session: Option<u64>, peer: &str, peer_id: String, event: FileEvent) {
+        if matches!(event.state, FileState::Done(_)) {
+            self.record(Entry {
+                when: opendesk_platform::system::local_time(),
+                incoming: event.incoming,
+                kind: Kind::File,
+                name: peer.to_string(),
+                id: peer_id,
+                control: false,
+                seconds: 0,
+                password: false,
+                file: event.name.clone(),
+            });
+        }
+        let (id, incoming) = (event.id, event.incoming);
+        let same = |t: &Transfer| t.session == session && t.event.id == id && t.event.incoming == incoming;
+        let transfer = Transfer { session, peer: peer.to_string(), event, updated: Instant::now() };
+        match self.transfers.iter_mut().find(|t| same(t)) {
+            Some(existing) => *existing = transfer,
+            None => self.transfers.push(transfer),
+        }
+    }
+
+    /// Envia o que saiu do seletor de arquivos ou foi arrastado para a
+    /// janela, e tira da lista o que já terminou há um tempo.
+    fn pump_files(&mut self, ctx: &egui::Context) {
+        let picked = self.picker.as_ref().and_then(|(target, chosen)| match chosen.try_recv() {
+            Ok(paths) => Some((*target, paths)),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some((*target, Vec::new())),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+        });
+        if let Some((target, paths)) = picked {
+            self.picker = None;
+            for path in paths {
+                self.send_file(target, path);
+            }
+        }
+        // Soltar arquivos sobre a tela remota envia para o computador remoto.
+        let sharing =
+            matches!(&self.outgoing, Some(Outgoing { stage: Stage::Live { permissions }, .. }) if permissions.files);
+        if sharing {
+            let dropped: Vec<PathBuf> = ctx.input(|i| {
+                i.raw.dropped_files.iter().map(|file| file.path().to_path_buf()).filter(|path| path.is_file()).collect()
+            });
+            for path in dropped {
+                self.send_file(None, path);
+            }
+        }
+        // Um arquivo recebido fica mais tempo na tela: é ali que se abre a pasta.
+        self.transfers.retain(|t| {
+            let keep = if matches!(t.event.state, FileState::Done(_)) && t.event.incoming { 30 } else { 8 };
+            !t.finished() || t.updated.elapsed() < Duration::from_secs(keep)
+        });
+        // Sessões que acabaram levam as suas linhas.
+        let outgoing_alive = self.outgoing.is_some();
+        let inbound = &self.inbound;
+        self.transfers.retain(|t| match t.session {
+            None => outgoing_alive,
+            Some(session) => inbound.iter().any(|s| s.session == session),
+        });
+    }
+
+    fn send_file(&mut self, target: Option<u64>, path: PathBuf) {
+        match target {
+            Some(session) => self.host.send_file(self.runtime.handle(), session, path),
+            None => {
+                if let Some(out) = &self.outgoing {
+                    out.viewer.send_file(path);
+                }
+            }
+        }
+    }
+
+    /// Abre o seletor de arquivos do sistema, numa thread própria: a janela
+    /// continua viva e o teclado para de ir para o computador remoto assim que
+    /// ela perde o foco.
+    fn pick_files(&mut self, target: Option<u64>) {
+        if self.picker.is_some() {
+            return;
+        }
+        let (chosen, receiver) = std::sync::mpsc::channel();
+        let wake = self.wake.clone();
+        let spawned = std::thread::Builder::new().name("opendesk-arquivos".into()).spawn(move || {
+            let paths = rfd::FileDialog::new().set_title("Enviar arquivos").pick_files().unwrap_or_default();
+            let _ = chosen.send(paths);
+            wake();
+        });
+        if spawned.is_ok() {
+            self.picker = Some((target, receiver));
+        }
+    }
+
+    /// As linhas de transferência de uma sessão, com as ações de cada uma.
+    fn transfer_rows(&mut self, ui: &mut egui::Ui, session: Option<u64>, ink: Color32) {
+        let mut action = None;
+        // Linhas baixas e juntas: é uma lista de acompanhamento, não um formulário.
+        let before = ui.spacing().clone();
+        ui.spacing_mut().interact_size.y = 20.0;
+        ui.spacing_mut().item_spacing.y = 3.0;
+        for transfer in self.transfers.iter().filter(|t| t.session == session) {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(transfer.describe()).small().color(ink));
+                match (&transfer.event.state, transfer.event.incoming) {
+                    (FileState::Offered, _) => {
+                        if ui.small_button("Receber").clicked() {
+                            action = Some(TransferAction::Answer(transfer.event.id, true));
+                        }
+                        if ui.small_button("Recusar").clicked() {
+                            action = Some(TransferAction::Answer(transfer.event.id, false));
+                        }
+                    }
+                    (FileState::Done(_), true) if ui.small_button("Abrir a pasta").clicked() => {
+                        action = Some(TransferAction::OpenFolder);
+                    }
+                    _ => {}
+                }
+            });
+        }
+        *ui.spacing_mut() = before;
+        match action {
+            Some(TransferAction::Answer(id, accept)) => {
+                if let Some(out) = &self.outgoing {
+                    out.viewer.answer_file(id, accept);
+                }
+            }
+            Some(TransferAction::OpenFolder) => self.open_external(self.files_dir.clone().as_os_str()),
+            None => {}
+        }
+    }
+
+    /// Abre uma pasta ou um endereço da web no programa padrão do sistema.
+    fn open_external(&mut self, target: &std::ffi::OsStr) {
+        let opener = if cfg!(windows) { "explorer" } else { "xdg-open" };
+        if let Err(err) = std::process::Command::new(opener).arg(target).spawn() {
+            tracing::warn!("não foi possível abrir {}: {err}", target.to_string_lossy());
+        }
+    }
+
     /// O acesso não supervisionado está de fato valendo: ligado, com senha
     /// salva e com a entrada aceita.
     fn unattended_active(&self) -> bool {
@@ -361,7 +562,11 @@ impl App {
     /// O máximo que uma sessão de entrada pode receber, pelas configurações.
     fn most_permissions(&self) -> Permissions {
         let control = self.settings.allow_control;
-        Permissions { control, clipboard: control && self.settings.allow_clipboard }
+        Permissions {
+            control,
+            clipboard: control && self.settings.allow_clipboard,
+            files: control && self.settings.allow_files,
+        }
     }
 
     /// Passa ao host a política de acesso não supervisionado em vigor.
@@ -391,7 +596,12 @@ impl App {
         password: bool,
     ) {
         let when = opendesk_platform::system::local_time();
-        let entry = Entry { when, incoming, kind, name: name.to_string(), id, control, seconds, password };
+        let file = String::new();
+        let entry = Entry { when, incoming, kind, name: name.to_string(), id, control, seconds, password, file };
+        self.record(entry);
+    }
+
+    fn record(&mut self, entry: Entry) {
         self.history.append(&entry);
         self.history_view.insert(0, entry);
         self.history_view.truncate(200);
@@ -455,12 +665,29 @@ impl App {
                         control,
                         seconds,
                         password: false,
+                        file: String::new(),
                     };
                     self.history_view = vec![
                         entry(false, Kind::Session, "NOTEBOOK-ANA", true, 1_260),
                         entry(true, Kind::Session, "SUPORTE-TI", false, 340),
                         entry(true, Kind::Refused, "DESCONHECIDO", false, 0),
                         entry(true, Kind::Blocked, "DESCONHECIDO", false, 0),
+                    ];
+                }
+                "arquivos" => {
+                    let transfer = |session, incoming, name: &str, state| Transfer {
+                        session,
+                        peer: "NOTEBOOK-ANA".into(),
+                        event: FileEvent { id: 0, incoming, name: name.into(), size: 4_800_000, state },
+                        updated: Instant::now() + Duration::from_secs(3600),
+                    };
+                    let saved = FileState::Done(self.files_dir.join("contrato.pdf"));
+                    self.transfers = vec![
+                        transfer(Some(0), true, "contrato.pdf", saved.clone()),
+                        transfer(Some(0), false, "planilha de custos.xlsx", FileState::Progress(2_100_000)),
+                        transfer(None, false, "relatório.pdf", FileState::Progress(3_300_000)),
+                        transfer(None, true, "fotos.zip", FileState::Offered),
+                        transfer(None, true, "contrato.pdf", saved),
                     ];
                 }
                 "config" => self.screen = Screen::Settings(Tab::General),
@@ -505,6 +732,7 @@ impl App {
             target,
             self.device_name.clone(),
             wants,
+            Some(self.files_dir.clone()),
             self.wake.clone(),
         );
         self.notice = None;
@@ -579,6 +807,13 @@ impl App {
                     self.requests.retain(|r| r.session != session);
                     self.inbound.push(Inbound { session, peer, permissions, since: Instant::now(), by_password });
                 }
+                HostEvent::File { session, transfer } => {
+                    let peer = self.inbound.iter().find(|s| s.session == session).map(|s| s.peer.clone());
+                    if let Some(peer) = peer {
+                        let id = peer.fingerprint.device_id().to_string();
+                        self.track(Some(session), &peer.name, id, transfer);
+                    }
+                }
                 HostEvent::PasswordFailed { peer, .. } => {
                     let id = peer.fingerprint.device_id().to_string();
                     self.log(true, Kind::BadPassword, &peer.name, id, false, 0);
@@ -601,6 +836,7 @@ impl App {
 
         let mut closed = None;
         let mut granted = false;
+        let mut files = Vec::new();
         if let Some(out) = &mut self.outgoing {
             while let Ok(event) = out.events.try_recv() {
                 match event {
@@ -631,11 +867,19 @@ impl App {
                         }
                     }
                     ViewerEvent::Display { index, .. } => out.display_index = index,
+                    ViewerEvent::File(transfer) => {
+                        let id = out.fingerprint.map_or_else(|| out.target.clone(), |f| f.device_id().to_string());
+                        files.push((out.host_name.clone(), id, transfer));
+                    }
                     ViewerEvent::Denied(_) => {}
                     ViewerEvent::Closed(reason) => closed = Some(reason),
                 }
             }
         }
+        for (peer, id, transfer) in files {
+            self.track(None, &peer, id, transfer);
+        }
+        self.pump_files(ctx);
         // O que foi copiado aqui vai para o computador remoto.
         if let Some(out) = &mut self.outgoing
             && let Some(text) = out.clipboard.as_mut().and_then(|clipboard| clipboard.poll())
@@ -676,6 +920,7 @@ impl eframe::App for App {
         let live = matches!(&self.outgoing, Some(Outgoing { stage: Stage::Live { .. }, .. }));
         if live {
             self.session_bar(ui, &p);
+            self.transfer_strip(ui, &p);
             self.inbound_banner(ui, &p);
             self.remote_screen(ui, &p);
         } else {
@@ -972,12 +1217,14 @@ impl App {
         if self.inbound.is_empty() {
             return;
         }
-        let mut end = None;
+        let (mut end, mut send) = (None, None);
+        let sessions: Vec<u64> = self.inbound.iter().map(|s| s.session).collect();
         egui::Panel::top("inbound")
             .frame(egui::Frame::new().fill(p.alert_bg).inner_margin(Margin::symmetric(16, 6)))
             .show_separator_line(false)
             .show(ui, |ui| {
-                for session in &self.inbound {
+                for id in sessions {
+                    let Some(session) = self.inbound.iter().find(|s| s.session == id) else { continue };
                     ui.horizontal(|ui| {
                         theme::dot(ui, p.alert_text);
                         let verb = if session.permissions.control { "está controlando" } else { "está vendo" };
@@ -991,15 +1238,34 @@ impl App {
                         ui.label(RichText::new(format!("{:02}:{:02}", secs / 60, secs % 60)).color(p.alert_text));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui.button("Encerrar acesso").clicked() {
-                                end = Some(session.session);
+                                end = Some(id);
+                            }
+                            if session.permissions.files && ui.button("Enviar arquivo").clicked() {
+                                send = Some(id);
                             }
                         });
                     });
+                    self.transfer_rows(ui, Some(id), p.alert_text);
                 }
             });
         if let Some(session) = end {
             self.host.disconnect(session);
         }
+        if let Some(session) = send {
+            self.pick_files(Some(session));
+        }
+    }
+
+    /// Arquivos da sessão em que este computador acessa outro: aparece só
+    /// enquanto há algo acontecendo.
+    fn transfer_strip(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        if !self.transfers.iter().any(|t| t.session.is_none()) {
+            return;
+        }
+        egui::Panel::top("transfers")
+            .frame(egui::Frame::new().fill(p.surface).inner_margin(Margin::symmetric(14, 5)))
+            .show_separator_line(false)
+            .show(ui, |ui| self.transfer_rows(ui, None, p.text));
     }
 
     fn request_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
@@ -1099,7 +1365,7 @@ impl App {
             }
         }
 
-        let (mut end, mut toggle_fullscreen) = (false, false);
+        let (mut end, mut toggle_fullscreen, mut pick) = (false, false, false);
         let fullscreen = self.fullscreen;
         let bar = egui::Panel::top("session-bar")
             .frame(egui::Frame::new().fill(p.side).inner_margin(Margin::symmetric(14, 6)))
@@ -1141,6 +1407,10 @@ impl App {
                         }
                         if permissions.control {
                             ui.menu_button("Ações", |ui| {
+                                if permissions.files && ui.button("Enviar arquivos…").clicked() {
+                                    pick = true;
+                                    ui.close();
+                                }
                                 let pause = if out.paused { "Retomar o controle" } else { "Pausar o controle" };
                                 if ui.button(pause).clicked() {
                                     out.paused = !out.paused;
@@ -1184,6 +1454,9 @@ impl App {
             self.fullscreen = !self.fullscreen;
             self.bar_until = Some(Instant::now() + Duration::from_millis(1500));
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        }
+        if pick {
+            self.pick_files(None);
         }
         if end {
             self.end_outgoing(None);

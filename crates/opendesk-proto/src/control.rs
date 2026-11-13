@@ -9,15 +9,21 @@ pub struct Permissions {
     pub control: bool,
     /// Sincronizar a área de transferência.
     pub clipboard: bool,
+    /// Enviar e receber arquivos.
+    pub files: bool,
 }
 
 impl Permissions {
-    pub const VIEW_ONLY: Self = Self { control: false, clipboard: false };
-    pub const FULL: Self = Self { control: true, clipboard: true };
+    pub const VIEW_ONLY: Self = Self { control: false, clipboard: false, files: false };
+    pub const FULL: Self = Self { control: true, clipboard: true, files: true };
 
     /// Nunca concede mais do que foi pedido.
     pub fn intersect(self, other: Self) -> Self {
-        Self { control: self.control && other.control, clipboard: self.clipboard && other.clipboard }
+        Self {
+            control: self.control && other.control,
+            clipboard: self.clipboard && other.clipboard,
+            files: self.files && other.files,
+        }
     }
 }
 

@@ -47,6 +47,8 @@ pub struct Settings {
     pub lock_on_end: bool,
     /// Texto copiado atravessa a sessão (só em acessos com controle).
     pub allow_clipboard: bool,
+    /// Arquivos podem ser trocados (só em acessos com controle).
+    pub allow_files: bool,
     /// Acesso não supervisionado: quem souber a senha entra sem aprovação.
     /// Só vale com uma senha salva (ver [`load_access`]).
     pub unattended: bool,
@@ -67,6 +69,7 @@ impl Default for Settings {
             allow_control: true,
             lock_on_end: false,
             allow_clipboard: true,
+            allow_files: true,
             unattended: false,
             rendezvous: ServerChoice::Default,
             rendezvous_url: String::new(),
@@ -224,6 +227,8 @@ pub enum Kind {
     Blocked,
     /// Senha de acesso não supervisionado errada.
     BadPassword,
+    /// Um arquivo trocado durante uma sessão.
+    File,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -240,6 +245,10 @@ pub struct Entry {
     /// A sessão foi liberada pela senha, sem ninguém aprovar.
     #[serde(default)]
     pub password: bool,
+    /// Nome do arquivo, quando o evento é uma transferência. Nesse caso
+    /// `incoming` diz se o arquivo chegou a este computador.
+    #[serde(default)]
+    pub file: String,
 }
 
 impl Entry {
@@ -249,6 +258,8 @@ impl Entry {
             Kind::Refused => "Recusado".into(),
             Kind::Blocked => "Bloqueado".into(),
             Kind::BadPassword => "Senha errada".into(),
+            Kind::File if self.incoming => format!("Recebeu {}", self.file),
+            Kind::File => format!("Enviou {}", self.file),
             Kind::Session => {
                 let mode = if self.control { "Controle" } else { "Só ver" };
                 let how = if self.password { " por senha" } else { "" };
@@ -256,6 +267,20 @@ impl Entry {
             }
         }
     }
+}
+
+/// Tamanho de arquivo legível: `512 B`, `1,5 MB`, `2,0 GB`.
+pub fn file_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["kB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let (mut value, mut unit) = (bytes as f64 / 1024.0, 0);
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit]).replace('.', ",")
 }
 
 fn duration(seconds: u64) -> String {
@@ -358,6 +383,7 @@ mod tests {
             control: true,
             seconds,
             password: false,
+            file: String::new(),
         };
         history.append(&entry("A", Kind::Session, 42));
         history.append(&entry("B", Kind::Refused, 0));
@@ -379,6 +405,9 @@ mod tests {
         assert_eq!(entry.summary(), "Só ver, 1 min");
         let by_password = Entry { password: true, control: true, ..entry };
         assert_eq!(by_password.summary(), "Controle por senha, 1 min");
+        let file = Entry { kind: Kind::File, file: "nota.pdf".into(), ..by_password };
+        assert_eq!(file.summary(), "Recebeu nota.pdf");
+        assert_eq!(Entry { incoming: false, ..file }.summary(), "Enviou nota.pdf");
     }
 
     #[test]
@@ -391,6 +420,16 @@ mod tests {
         let on_disk = std::fs::read_to_string(dir.join("unattended.json")).unwrap();
         assert!(!on_disk.contains("comprida"), "a senha digitada não pode ir para o disco");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn file_sizes_read_naturally() {
+        assert_eq!(file_size(0), "0 B");
+        assert_eq!(file_size(1023), "1023 B");
+        assert_eq!(file_size(1536), "1,5 kB");
+        assert_eq!(file_size(300_000), "293,0 kB");
+        assert_eq!(file_size(5 * 1024 * 1024), "5,0 MB");
+        assert_eq!(file_size(3 * 1024 * 1024 * 1024), "3,0 GB");
     }
 
     #[test]

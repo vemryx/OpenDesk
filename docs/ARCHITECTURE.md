@@ -62,7 +62,8 @@ Tudo o que o app guarda fica na pasta de dados do usuário, em texto legível (`
 |---|---|
 | `settings.json` | Configurações. Campos ausentes valem o padrão; arquivo corrompido não impede o app de abrir. |
 | `recent.json` | Os oito computadores acessados por último. |
-| `history.jsonl` | Registro de sessões, só acrescentado: uma linha JSON por sessão feita ou recebida e por pedido recusado (pela pessoa ou pela política). |
+| `history.jsonl` | Registro de sessões, só acrescentado: uma linha JSON por sessão feita ou recebida, por pedido recusado (pela pessoa ou pela política), por senha errada e por arquivo trocado. |
+| `unattended.json` | A senha de acesso não supervisionado, na forma derivada (ver abaixo). |
 | `known_hosts` | Impressões digitais fixadas (ver abaixo). |
 | `identity.*.der` | A chave e o certificado do dispositivo. |
 
@@ -124,6 +125,25 @@ Para quando a conexão direta não passa. Como a sessão é QUIC com TLS de pont
 - **Limites contra abuso** no relay: sessões simultâneas (256), banda por sessão (20 Mbit/s), sessões novas por IP por minuto (30) e expiração por inatividade (30 s). Tudo ajustável por parâmetro.
 
 O que ainda não existe são os **relays comunitários**: uma lista pública de relays voluntários que o aplicativo use sozinho. Para isso faltam tokens emitidos pelo servidor de encontro (hoje qualquer par que conheça o endereço de um relay pode usá-lo, dentro dos limites), medição de saúde para escolher um relay bom, e um jeito de publicar e retirar relays da lista. Enquanto isso não existir, o relay é "traga o seu", e o OpenDesk não promete conexão em qualquer rede sem ele.
+
+## Transferência de arquivos
+
+Cada arquivo viaja num stream QUIC bidirecional próprio, aberto por quem envia: não trava o controle nem o vídeo e herda a cifragem de ponta a ponta da sessão.
+
+```
+quem envia                      quem recebe
+  Offer { nome, tamanho }  ──▶
+                           ◀──  Accept | Refuse
+  bytes… (fim do stream)   ──▶
+                           ◀──  Saved | Failed
+```
+
+- **Permissão própria** (`files`), que só existe em acessos com controle e pode ser desligada nas configurações. Sem ela, nada é enviado nem aceito, nos dois sentidos.
+- **Quem decide.** O host aceita sem perguntar o que vem de quem já o controla (é o que permite usar com acesso não supervisionado). No sentido contrário, quem acessa confirma arquivo a arquivo: o computador remoto não grava nada no disco de quem o está vendo sem um "Receber".
+- **O nome vem da rede e não é confiável.** Quem recebe tira qualquer caminho, troca caracteres proibidos, neutraliza nomes reservados do Windows e limita o tamanho. O arquivo é gravado só na pasta de recebidos (`Downloads\OpenDesk`, ou `OPENDESK_FILES_DIR`), com um sufixo temporário, e só ganha o nome final depois de chegar inteiro; um nome repetido vira `nome (1).ext` em vez de sobrescrever.
+- **Limites.** 16 GB por arquivo; o tamanho anunciado é conferido nos dois lados, e o que chega a mais ou a menos é descartado.
+
+O código está em `crates/opendesk-session/src/files.rs`.
 
 ## Acesso não supervisionado
 
@@ -197,7 +217,7 @@ Onde o OpenDesk diverge de propósito: QUIC em vez de protocolo próprio sobre T
 1. **Relays comunitários**: lista pública, tokens emitidos pelo servidor de encontro, escolha automática.
 2. **Desempenho**: codec de vídeo na GPU, qualidade adaptativa, teto de bitrate.
 3. **Vários visualizadores** no mesmo host, compartilhando uma única captura de tela.
-4. **Experiência**: transferência de arquivos, área de transferência com imagens e arquivos, cursor remoto, conversa por texto, gravação da sessão, apelidos e favoritos nos computadores recentes.
+4. **Experiência**: navegador de arquivos remoto e envio de pastas, área de transferência com imagens e arquivos, cursor remoto, conversa por texto, gravação da sessão, apelidos e favoritos nos computadores recentes.
 5. **Segurança**: gerenciar hosts fixados pela interface, chave e senha de acesso protegidas por DPAPI, lista de dispositivos autorizados, segundo fator.
 6. **Serviço Windows**: UAC, tela de logon e Ctrl+Alt+Del; é o que falta para o acesso não supervisionado funcionar com o computador bloqueado ou antes do login.
 7. **Distribuição**: releases automáticos, assinatura de código (SignPath para projetos abertos), Linux e macOS, domínio próprio para o servidor de encontro.
@@ -214,5 +234,6 @@ Onde o OpenDesk diverge de propósito: QUIC em vez de protocolo próprio sobre T
 - Monitores rotacionados não são corrigidos.
 - O acesso não supervisionado depende de o OpenDesk estar aberto numa sessão do Windows desbloqueada: sem o serviço, não há como ver a tela de bloqueio nem a de login.
 - A área de transferência sincroniza só texto.
+- A transferência de arquivos envia arquivos soltos, não pastas, e não retoma um envio interrompido.
 - O ponteiro do mouse remoto não é desenhado; o cursor local faz esse papel.
 - Reduzir uma tela 4K numa janela pequena usa filtro bilinear simples, sem mipmaps.

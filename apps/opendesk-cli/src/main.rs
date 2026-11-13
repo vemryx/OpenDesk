@@ -9,6 +9,7 @@ use opendesk_net::{DeviceId, Identity, Nat, Node, Presence};
 use opendesk_proto::control::Permissions;
 use opendesk_session::auth::PasswordAccess;
 use opendesk_session::backend::SystemBackend;
+use opendesk_session::files::{FileEvent, FileState};
 use opendesk_session::host::{Host, HostEvent, Unattended};
 use opendesk_session::viewer::{Lookup, Target, Viewer, ViewerEvent};
 use std::io::Write;
@@ -51,6 +52,10 @@ enum Command {
         /// Escuta só em 127.0.0.1: nada fora deste computador conecta.
         #[arg(long)]
         loopback: bool,
+        /// Pasta onde gravar os arquivos enviados pelos visualizadores. Sem
+        /// ela, o host não recebe arquivos.
+        #[arg(long)]
+        files_dir: Option<PathBuf>,
     },
     /// Conecta a um host e mede a recepção; opcionalmente salva a tela em PNG.
     View {
@@ -68,6 +73,10 @@ enum Command {
         /// Entra com a senha de acesso não supervisionado do host.
         #[arg(long, env = "OPENDESK_PASSWORD")]
         password: Option<String>,
+        /// Envia este arquivo ao host assim que a sessão começar (exige
+        /// `--control` e a permissão de arquivos).
+        #[arg(long)]
+        send: Option<PathBuf>,
     },
 }
 
@@ -106,14 +115,29 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Host { port, display, auto_accept_loopback, password, loopback } => {
+        Command::Host { port, display, auto_accept_loopback, password, loopback, files_dir } => {
             let identity = Arc::new(Identity::load_or_create(&data_dir)?);
-            runtime()?.block_on(host(identity, &data_dir, port, display, auto_accept_loopback, password, loopback))
+            let options = HostOptions { port, display, auto: auto_accept_loopback, password, loopback, files_dir };
+            runtime()?.block_on(host(identity, &data_dir, options))
         }
-        Command::View { target, seconds, out, control, password } => {
+        Command::View { target, seconds, out, control, password, send } => {
             let identity = Arc::new(Identity::load_or_create(&data_dir)?);
-            runtime()?.block_on(view(identity, &data_dir, &target, seconds, out, control, password))
+            let options = ViewOptions { seconds, out, control, password, send };
+            runtime()?.block_on(view(identity, &data_dir, &target, options))
         }
+    }
+}
+
+/// Uma linha por novidade de um arquivo (o progresso não é impresso).
+fn print_file(transfer: &FileEvent) {
+    let direction = if transfer.incoming { "Recebido" } else { "Enviado" };
+    match &transfer.state {
+        FileState::Done(path) => {
+            println!("{direction}: {} ({} bytes) em {}", transfer.name, transfer.size, path.display());
+        }
+        FileState::Refused => println!("Arquivo recusado: {}", transfer.name),
+        FileState::Failed(why) => println!("Arquivo {} falhou: {why}", transfer.name),
+        FileState::Offered | FileState::Progress(_) => {}
     }
 }
 
@@ -125,15 +149,17 @@ fn device_name() -> String {
     std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "dispositivo".into())
 }
 
-async fn host(
-    identity: Arc<Identity>,
-    data_dir: &Path,
+struct HostOptions {
     port: u16,
     display: usize,
     auto: Option<AutoAccept>,
     password: Option<String>,
     loopback: bool,
-) -> Result<()> {
+    files_dir: Option<PathBuf>,
+}
+
+async fn host(identity: Arc<Identity>, data_dir: &Path, options: HostOptions) -> Result<()> {
+    let HostOptions { port, display, auto, password, loopback, files_dir } = options;
     let local_only = auto.is_some() || loopback;
     let ip = if local_only { IpAddr::V4(Ipv4Addr::LOCALHOST) } else { IpAddr::V4(Ipv4Addr::UNSPECIFIED) };
     let node = Arc::new(Node::bind(identity.clone(), SocketAddr::new(ip, port))?);
@@ -157,6 +183,10 @@ async fn host(
     }
 
     let (host, mut events) = Host::new(node, Arc::new(SystemBackend { display }), device_name(), Arc::new(|| {}));
+    if let Some(dir) = &files_dir {
+        println!("Arquivos recebidos vão para {}", dir.display());
+    }
+    host.set_files_dir(files_dir);
     // Com senha, este é um host sem ninguém na frente: os pedidos ficam
     // aguardando (até expirar) em vez de perguntar no terminal.
     let headless = password.is_some();
@@ -198,6 +228,7 @@ async fn host(
             HostEvent::PasswordFailed { peer, .. } => {
                 println!("Senha de acesso errada vinda de \"{}\" ({}).", peer.name, peer.fingerprint.short());
             }
+            HostEvent::File { transfer, .. } => print_file(&transfer),
             HostEvent::Ended { reason, .. } => println!("Sessão encerrada: {reason}"),
         }
     }
@@ -232,15 +263,16 @@ fn ask(wants: Permissions) -> Result<Option<Permissions>> {
     })
 }
 
-async fn view(
-    identity: Arc<Identity>,
-    data_dir: &Path,
-    target: &str,
+struct ViewOptions {
     seconds: f32,
     out: Option<PathBuf>,
     control: bool,
     password: Option<String>,
-) -> Result<()> {
+    send: Option<PathBuf>,
+}
+
+async fn view(identity: Arc<Identity>, data_dir: &Path, target: &str, options: ViewOptions) -> Result<()> {
+    let ViewOptions { seconds, out, control, password, send } = options;
     let target = if let Some(id) = DeviceId::parse(target) {
         let lookup = Lookup::from_env(data_dir)?
             .context("conectar por ID exige um servidor de encontro (defina OPENDESK_RENDEZVOUS)")?;
@@ -252,7 +284,7 @@ async fn view(
     let node = Arc::new(Node::bind(identity, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?);
     let wants = if control { Permissions::FULL } else { Permissions::VIEW_ONLY };
     let (viewer, mut events) =
-        Viewer::connect(&tokio::runtime::Handle::current(), node, target, device_name(), wants, Arc::new(|| {}));
+        Viewer::connect(&tokio::runtime::Handle::current(), node, target, device_name(), wants, None, Arc::new(|| {}));
 
     loop {
         match events.recv().await.context("a sessão terminou sem aviso")? {
@@ -284,7 +316,8 @@ async fn view(
                     if retry { "" } else { " e o host bloqueou novas tentativas por enquanto" }
                 )
             }
-            ViewerEvent::Denied(_) | ViewerEvent::Clipboard(_) | ViewerEvent::Display { .. } => {}
+            ViewerEvent::Denied(_) | ViewerEvent::Clipboard(_) | ViewerEvent::Display { .. } | ViewerEvent::File(_) => {
+            }
             ViewerEvent::Closed(reason) => bail!("{reason}"),
         }
     }
@@ -299,6 +332,25 @@ async fn view(
         }
         tokio::time::sleep(Duration::from_millis(2)).await;
     };
+    // Com um arquivo a enviar, espera a transferência terminar.
+    if let Some(path) = send {
+        viewer.send_file(path);
+        loop {
+            match events.recv().await.context("a sessão terminou durante o envio")? {
+                ViewerEvent::File(transfer) => {
+                    print_file(&transfer);
+                    match transfer.state {
+                        FileState::Done(_) => break,
+                        FileState::Refused => bail!("o host recusou o arquivo"),
+                        FileState::Failed(why) => bail!("o envio falhou: {why}"),
+                        FileState::Offered | FileState::Progress(_) => {}
+                    }
+                }
+                ViewerEvent::Closed(reason) => bail!("{reason}"),
+                _ => {}
+            }
+        }
+    }
     tokio::time::sleep(Duration::from_secs_f32(seconds.max(0.0))).await;
 
     {

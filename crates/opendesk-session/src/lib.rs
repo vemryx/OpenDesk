@@ -7,11 +7,13 @@
 //! * [`viewer`] — conecta a um host, mantém o framebuffer remoto e envia
 //!   mouse e teclado.
 //! * [`auth`] — a senha de acesso não supervisionado (SPAKE2).
+//! * [`files`] — transferência de arquivos durante a sessão.
 //! * [`backend`] — de onde vêm os quadros e para onde vai a entrada. A
 //!   implementação real usa `opendesk-platform`; os testes usam uma falsa.
 
 pub mod auth;
 pub mod backend;
+pub mod files;
 pub mod host;
 pub mod viewer;
 

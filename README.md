@@ -25,11 +25,12 @@ Acesso remoto ponto a ponto, gratuito e de código aberto. Uma alternativa ao An
 - **Autorização explícita**: por padrão, toda conexão precisa ser aprovada por quem está no computador, que escolhe entre só ver ou permitir controle. A sessão ativa fica sempre visível e pode ser encerrada com um clique.
 - **Acesso não supervisionado** (opcional, desligado de fábrica): com uma senha definida de propósito, dá para entrar em um computador seu sem ninguém aprovar. A senha nunca trafega (SPAKE2), tentativas erradas são contadas e bloqueiam a porta, e tudo fica no histórico.
 - **Durante a sessão**: área de transferência de texto entre os dois computadores, troca entre os monitores do computador remoto, tela cheia, pausar o controle e bloquear o computador remoto.
+- **Transferência de arquivos** nos dois sentidos: pelo menu Ações ou arrastando o arquivo para a tela remota. O que chega fica em `Downloads\OpenDesk`, nunca sobrescreve nada, e quem acessa confirma cada arquivo que o outro computador quiser mandar.
 - **Cifragem de ponta a ponta**: QUIC com TLS 1.3 e identidade criptográfica por dispositivo. Não há servidor que possa ler a sessão.
 - Imagem sem perdas para texto e interface, JPEG para foto e vídeo, com refinamento automático quando a tela para.
 - **Computadores recentes** na tela inicial: um clique reconecta.
-- **Configurações** para uso pessoal e para empresas: nome e tema; abrir com o Windows; aceitar ou não pedidos de acesso; limitar quem acessa a "só ver"; bloquear o Windows ao fim do acesso; área de transferência; acesso não supervisionado; servidor de encontro e relay próprios; porta.
-- **Histórico de sessões** em arquivo (`history.jsonl`, uma linha JSON por evento), com as sessões feitas e recebidas e os pedidos recusados.
+- **Configurações** para uso pessoal e para empresas: nome e tema; abrir com o Windows; aceitar ou não pedidos de acesso; limitar quem acessa a "só ver"; bloquear o Windows ao fim do acesso; área de transferência; transferência de arquivos; acesso não supervisionado; servidor de encontro e relay próprios; porta.
+- **Histórico de sessões** em arquivo (`history.jsonl`, uma linha JSON por evento), com as sessões feitas e recebidas, os pedidos recusados, as senhas erradas e os arquivos trocados.
 - Um executável único, sem instalador.
 
 ## Usar

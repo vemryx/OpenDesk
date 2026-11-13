@@ -8,9 +8,11 @@ use opendesk_proto::control::{DenyReason, InputEvent, MouseButton, Permissions};
 use opendesk_session::Wake;
 use opendesk_session::auth::PasswordAccess;
 use opendesk_session::backend::{Backend, Clipboard, FrameSource, InputSink};
+use opendesk_session::files::{FileEvent, FileState};
 use opendesk_session::host::{Host, HostEvent, Unattended};
 use opendesk_session::viewer::{Route, Target, Viewer, ViewerEvent};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -33,6 +35,10 @@ struct Shared {
     /// Como cada sessão começou: `true` = pela senha.
     started: Mutex<Vec<bool>>,
     password_failures: AtomicU64,
+    /// Sessões iniciadas, para o host poder enviar arquivos a elas.
+    sessions: Mutex<Vec<u64>>,
+    /// Tudo o que o host soube sobre arquivos.
+    files: Mutex<Vec<FileEvent>>,
 }
 
 struct FakeBackend(Arc<Shared>);
@@ -168,7 +174,11 @@ fn start_host_with(
                         None => unanswered.push(reply),
                     }
                 }
-                HostEvent::Started { by_password, .. } => probe.started.lock().unwrap().push(by_password),
+                HostEvent::Started { session, by_password, .. } => {
+                    probe.started.lock().unwrap().push(by_password);
+                    probe.sessions.lock().unwrap().push(session);
+                }
+                HostEvent::File { transfer, .. } => probe.files.lock().unwrap().push(transfer),
                 HostEvent::PasswordFailed { .. } => {
                     probe.password_failures.fetch_add(1, Ordering::SeqCst);
                 }
@@ -186,8 +196,43 @@ fn unattended(password: &str, permissions: Permissions) -> Option<Unattended> {
 }
 
 fn start_viewer(addr: SocketAddr, wants: Permissions) -> (Viewer, UnboundedReceiver<ViewerEvent>) {
+    start_viewer_saving_to(addr, wants, None)
+}
+
+fn start_viewer_saving_to(
+    addr: SocketAddr,
+    wants: Permissions,
+    files_dir: Option<PathBuf>,
+) -> (Viewer, UnboundedReceiver<ViewerEvent>) {
     let (target, name) = (Target::Address(addr), "visualizador-de-teste".into());
-    Viewer::connect(&tokio::runtime::Handle::current(), node(), target, name, wants, no_wake())
+    Viewer::connect(&tokio::runtime::Handle::current(), node(), target, name, wants, files_dir, no_wake())
+}
+
+/// Pasta temporária vazia, só deste teste.
+fn temp_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("opendesk-sessao-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Um arquivo de conteúdo conhecido, maior que um bloco de envio.
+fn sample_file(dir: &Path, name: &str, seed: u8) -> (PathBuf, Vec<u8>) {
+    let content: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8 ^ seed).collect();
+    let path = dir.join(name);
+    std::fs::write(&path, &content).unwrap();
+    (path, content)
+}
+
+/// O próximo evento de arquivo que não seja só progresso.
+async fn next_file(events: &mut UnboundedReceiver<ViewerEvent>) -> FileEvent {
+    loop {
+        match next(events).await {
+            ViewerEvent::File(FileEvent { state: FileState::Progress(_), .. }) => {}
+            ViewerEvent::File(transfer) => return transfer,
+            other => panic!("esperava um evento de arquivo, veio {other:?}"),
+        }
+    }
 }
 
 async fn next(events: &mut UnboundedReceiver<ViewerEvent>) -> ViewerEvent {
@@ -487,4 +532,103 @@ async fn lock_request_reaches_the_host_when_control_is_allowed() {
     next(&mut events).await;
     viewer.lock_remote();
     until("bloqueio pedido", || shared.locks.load(Ordering::SeqCst) == 1).await;
+}
+
+// ───────────────────────────── Arquivos ─────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn viewer_sends_files_and_the_host_saves_them_without_overwriting() {
+    let (source, inbox) = (temp_dir("envio-origem"), temp_dir("envio-destino"));
+    let (shared, host, addr, _ended) = start_host(Some(Permissions::FULL));
+    host.set_files_dir(Some(inbox.clone()));
+    let (viewer, mut events) = start_viewer(addr, Permissions::FULL);
+    next(&mut events).await;
+    assert!(matches!(next(&mut events).await, ViewerEvent::Granted { permissions, .. } if permissions.files));
+
+    let (path, content) = sample_file(&source, "relatório.bin", 7);
+    viewer.send_file(path.clone());
+    let sent = next_file(&mut events).await;
+    assert_eq!((sent.incoming, sent.name.as_str(), sent.size), (false, "relatório.bin", content.len() as u64));
+    assert_eq!(sent.state, FileState::Done(path.clone()));
+    assert_eq!(std::fs::read(inbox.join("relatório.bin")).unwrap(), content);
+
+    // O mesmo nome de novo não apaga o primeiro.
+    std::fs::write(&path, b"segunda versao").unwrap();
+    viewer.send_file(path);
+    assert!(matches!(next_file(&mut events).await.state, FileState::Done(_)));
+    assert_eq!(std::fs::read(inbox.join("relatório (1).bin")).unwrap(), b"segunda versao");
+    assert_eq!(std::fs::read(inbox.join("relatório.bin")).unwrap(), content);
+
+    // O host soube dos dois, e não sobrou arquivo pela metade.
+    until("host avisado", || {
+        shared.files.lock().unwrap().iter().filter(|f| f.incoming && matches!(f.state, FileState::Done(_))).count() == 2
+    })
+    .await;
+    assert_eq!(std::fs::read_dir(&inbox).unwrap().count(), 2);
+    for dir in [source, inbox] {
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn host_files_reach_the_viewer_only_when_accepted() {
+    let (source, inbox) = (temp_dir("oferta-origem"), temp_dir("oferta-destino"));
+    let (shared, host, addr, _ended) = start_host(Some(Permissions::FULL));
+    let (viewer, mut events) = start_viewer_saving_to(addr, Permissions::FULL, Some(inbox.clone()));
+    next(&mut events).await;
+    next(&mut events).await;
+    until("sessão registrada", || !shared.sessions.lock().unwrap().is_empty()).await;
+    let session = shared.sessions.lock().unwrap()[0];
+    let runtime = tokio::runtime::Handle::current();
+
+    // Aceito: chega inteiro.
+    let (path, content) = sample_file(&source, "do-host.bin", 3);
+    host.send_file(&runtime, session, path);
+    let offer = next_file(&mut events).await;
+    assert_eq!((offer.incoming, offer.name.as_str(), &offer.state), (true, "do-host.bin", &FileState::Offered));
+    assert!(!inbox.join("do-host.bin").exists(), "nada é gravado antes de a pessoa aceitar");
+    viewer.answer_file(offer.id, true);
+    assert_eq!(next_file(&mut events).await.state, FileState::Done(inbox.join("do-host.bin")));
+    assert_eq!(std::fs::read(inbox.join("do-host.bin")).unwrap(), content);
+
+    // Recusado: nada é gravado, e o host fica sabendo.
+    let (path, _) = sample_file(&source, "indesejado.bin", 5);
+    host.send_file(&runtime, session, path);
+    let offer = next_file(&mut events).await;
+    viewer.answer_file(offer.id, false);
+    assert_eq!(next_file(&mut events).await.state, FileState::Refused);
+    until("host soube da recusa", || {
+        shared.files.lock().unwrap().iter().any(|f| f.name == "indesejado.bin" && f.state == FileState::Refused)
+    })
+    .await;
+    assert_eq!(std::fs::read_dir(&inbox).unwrap().count(), 1);
+    for dir in [source, inbox] {
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn files_do_not_move_without_the_permission() {
+    let (source, inbox) = (temp_dir("negado-origem"), temp_dir("negado-destino"));
+    // A pessoa no host só deixou ver: sem arquivos em nenhum sentido.
+    let (shared, host, addr, _ended) = start_host(Some(Permissions::VIEW_ONLY));
+    host.set_files_dir(Some(inbox.clone()));
+    let (viewer, mut events) = start_viewer_saving_to(addr, Permissions::FULL, Some(inbox.clone()));
+    next(&mut events).await;
+    assert!(matches!(next(&mut events).await, ViewerEvent::Granted { permissions, .. } if !permissions.files));
+    until("sessão registrada", || !shared.sessions.lock().unwrap().is_empty()).await;
+    let session = shared.sessions.lock().unwrap()[0];
+
+    let (path, _) = sample_file(&source, "barrado.bin", 9);
+    viewer.send_file(path.clone());
+    assert!(matches!(next_file(&mut events).await.state, FileState::Failed(_)));
+    host.send_file(&tokio::runtime::Handle::current(), session, path);
+    until("host recusou enviar", || {
+        shared.files.lock().unwrap().iter().any(|f| !f.incoming && matches!(f.state, FileState::Failed(_)))
+    })
+    .await;
+    assert_eq!(std::fs::read_dir(&inbox).unwrap().count(), 0);
+    for dir in [source, inbox] {
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

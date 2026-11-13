@@ -1,5 +1,6 @@
 use crate::auth::{HostExchange, MAX_FAILURES_PER_CONNECTION, PasswordAccess, Throttle};
 use crate::backend::Backend;
+use crate::files::{self, FileEvent, FileState};
 use crate::{Wake, describe_close};
 use anyhow::{Context, Result, anyhow, bail};
 use opendesk_codec::{Encoder, EncoderConfig, FrameRef};
@@ -10,6 +11,7 @@ use opendesk_proto::control::{Decision, DenyReason, DisplayDesc, HostMsg, MAX_CL
 use opendesk_proto::wire::{send_msg, write_frame};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -49,6 +51,8 @@ pub enum HostEvent {
     },
     /// Alguém errou a senha de acesso não supervisionado.
     PasswordFailed { session: u64, peer: PeerInfo },
+    /// Um arquivo chegando ou saindo numa sessão.
+    File { session: u64, transfer: FileEvent },
     /// Enviado para todo `Request`, tenha a sessão começado ou não.
     Ended { session: u64, reason: String },
 }
@@ -75,6 +79,11 @@ pub struct Host {
     /// `None` (o padrão): toda sessão depende de alguém aprovar aqui.
     unattended: Mutex<Option<Unattended>>,
     throttle: Mutex<Throttle>,
+    /// Onde gravar o que os visualizadores enviam. `None`: não recebe.
+    files_dir: Mutex<Option<PathBuf>>,
+    /// Sessões em andamento que podem trocar arquivos.
+    sharing: Mutex<HashMap<u64, quinn::Connection>>,
+    next_file: AtomicU64,
 }
 
 impl Host {
@@ -96,6 +105,9 @@ impl Host {
             streaming: Arc::new(AtomicBool::new(false)),
             unattended: Mutex::new(None),
             throttle: Mutex::new(Throttle::default()),
+            files_dir: Mutex::new(None),
+            sharing: Mutex::new(HashMap::new()),
+            next_file: AtomicU64::new(1),
         };
         (Arc::new(host), receiver)
     }
@@ -139,6 +151,70 @@ impl Host {
         *self.unattended.lock().unwrap() = unattended;
     }
 
+    /// Define a pasta onde ficam os arquivos recebidos.
+    pub fn set_files_dir(&self, dir: Option<PathBuf>) {
+        *self.files_dir.lock().unwrap() = dir;
+    }
+
+    /// Envia um arquivo a quem está na sessão `session`. O andamento chega
+    /// como `HostEvent::File`.
+    pub fn send_file(self: &Arc<Self>, runtime: &tokio::runtime::Handle, session: u64, path: PathBuf) {
+        let id = self.next_file.fetch_add(1, Ordering::Relaxed);
+        let host = self.clone();
+        runtime.spawn(async move {
+            let report = |name: &str, size: u64, state: FileState| {
+                let transfer = FileEvent { id, incoming: false, name: name.to_string(), size, state };
+                host.emit(HostEvent::File { session, transfer });
+            };
+            let shown = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+            let (name, size) = match files::describe(&path) {
+                Ok(described) => described,
+                Err(err) => return report(&shown, 0, FileState::Failed(format!("{err:#}"))),
+            };
+            let conn = host.sharing.lock().unwrap().get(&session).cloned();
+            let Some(conn) = conn else {
+                return report(&name, size, FileState::Failed("Esta sessão não permite enviar arquivos.".into()));
+            };
+            report(&name, size, FileState::Progress(0));
+            let sent =
+                files::send(&conn, &path, &name, size, |done| report(&name, size, FileState::Progress(done))).await;
+            report(
+                &name,
+                size,
+                match sent {
+                    Ok(files::Sent::Delivered) => FileState::Done(path.clone()),
+                    Ok(files::Sent::Refused) => FileState::Refused,
+                    Err(err) => FileState::Failed(format!("{err:#}")),
+                },
+            );
+        });
+    }
+
+    /// Recebe um arquivo vindo do visualizador da sessão `session`. Quem tem
+    /// permissão de arquivos envia sem perguntar: já controla este computador.
+    async fn receive_file(
+        self: Arc<Self>,
+        session: u64,
+        allowed: bool,
+        mut tx: quinn::SendStream,
+        mut rx: quinn::RecvStream,
+    ) {
+        let Ok((name, size)) = files::read_offer(&mut rx).await else { return };
+        let dir = self.files_dir.lock().unwrap().clone();
+        let (true, Some(dir)) = (allowed, dir) else { return files::refuse(&mut tx).await };
+        let id = self.next_file.fetch_add(1, Ordering::Relaxed);
+        let report = |state: FileState| {
+            let transfer = FileEvent { id, incoming: true, name: name.clone(), size, state };
+            self.emit(HostEvent::File { session, transfer });
+        };
+        report(FileState::Progress(0));
+        let saved = files::save(&mut tx, &mut rx, &dir, &name, size, |done| report(FileState::Progress(done))).await;
+        report(match saved {
+            Ok(path) => FileState::Done(path),
+            Err(err) => FileState::Failed(format!("{err:#}")),
+        });
+    }
+
     /// Encerra uma sessão (ou cancela um pedido pendente).
     pub fn disconnect(&self, session: u64) {
         if let Some(conn) = self.connections.lock().unwrap().get(&session) {
@@ -157,7 +233,7 @@ impl Host {
         (self.wake)();
     }
 
-    async fn run(&self, session: u64, peer: &PeerConn, announced: &mut bool) -> Result<String> {
+    async fn run(self: &Arc<Self>, session: u64, peer: &PeerConn, announced: &mut bool) -> Result<String> {
         let conn = &peer.conn;
         let (mut tx, rx) = timeout(HANDSHAKE_TIMEOUT, conn.accept_bi())
             .await
@@ -386,11 +462,23 @@ impl Host {
                 }
             }
         };
+        // Cada arquivo que o visualizador envia abre um stream próprio.
+        let incoming_files = async {
+            while let Ok((tx, rx)) = conn.accept_bi().await {
+                tokio::spawn(self.clone().receive_file(session, granted.files, tx, rx));
+            }
+            std::future::pending::<()>().await
+        };
+        if granted.files {
+            self.sharing.lock().unwrap().insert(session, conn.clone());
+        }
         let reason = tokio::select! {
             result = video => result.unwrap_or_else(|err| format!("{err:#}")),
             reason = control => reason,
+            () = incoming_files => unreachable!("só termina com a sessão"),
             closed = conn.closed() => describe_close(&closed),
         };
+        self.sharing.lock().unwrap().remove(&session);
         sink.release_all();
         Ok(reason)
     }

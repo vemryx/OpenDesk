@@ -1,4 +1,5 @@
 use crate::auth::{SessionKey, ViewerExchange, stretch};
+use crate::files::{self, FileEvent, FileState};
 use crate::{Wake, describe_close};
 use anyhow::{Context, Result, anyhow, bail};
 use opendesk_codec::decode_packet;
@@ -9,10 +10,13 @@ use opendesk_proto::control::{
 };
 use opendesk_proto::video::FramePacket;
 use opendesk_proto::wire::{MAX_VIDEO_FRAME, read_frame, send_msg};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 /// Framebuffer remoto, compartilhado entre a tarefa de rede e a interface.
 #[derive(Default)]
@@ -138,6 +142,9 @@ pub enum ViewerEvent {
         index: u8,
         display: DisplayDesc,
     },
+    /// Um arquivo chegando ou saindo. Um que chega começa como
+    /// `FileState::Offered` e espera [`Viewer::answer_file`].
+    File(FileEvent),
     Denied(DenyReason),
     /// A sessão terminou (ou nem chegou a começar). Sempre o último evento.
     Closed(String),
@@ -150,6 +157,7 @@ enum Command {
     Clipboard(String),
     SelectDisplay(u8),
     Lock,
+    SendFile(PathBuf),
 }
 
 #[derive(Clone)]
@@ -167,7 +175,14 @@ pub struct Viewer {
     commands: mpsc::UnboundedSender<Command>,
     cancel: Arc<Notify>,
     link: Arc<Mutex<Option<quinn::Connection>>>,
+    offers: Offers,
 }
+
+/// Arquivos oferecidos pelo host, aguardando a pessoa aceitar ou recusar.
+type Offers = Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>;
+
+/// Quanto tempo uma oferta de arquivo espera resposta antes de ser recusada.
+const OFFER_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl Viewer {
     /// Começa a conectar a `target`. Os eventos chegam pelo canal devolvido.
@@ -177,6 +192,7 @@ impl Viewer {
         target: Target,
         device_name: String,
         wants: Permissions,
+        files_dir: Option<PathBuf>,
         wake: Wake,
     ) -> (Self, mpsc::UnboundedReceiver<ViewerEvent>) {
         let frame = Arc::new(Mutex::new(SharedFrame::default()));
@@ -185,7 +201,19 @@ impl Viewer {
         let cancel = Arc::new(Notify::new());
 
         let link = Arc::new(Mutex::new(None));
-        let task = Task { node, target, device_name, wants, frame: frame.clone(), events, wake, link: link.clone() };
+        let offers = Offers::default();
+        let task = Task {
+            node,
+            target,
+            device_name,
+            wants,
+            frame: frame.clone(),
+            out: Emitter { events, wake },
+            link: link.clone(),
+            files_dir,
+            offers: offers.clone(),
+            next_file: Arc::new(AtomicU64::new(1)),
+        };
         let cancelled = cancel.clone();
         runtime.spawn(async move {
             let reason = tokio::select! {
@@ -194,7 +222,7 @@ impl Viewer {
             };
             task.emit(ViewerEvent::Closed(reason));
         });
-        (Self { frame, commands, cancel, link }, event_rx)
+        (Self { frame, commands, cancel, link, offers }, event_rx)
     }
 
     /// Latência de ida e volta medida pelo QUIC, quando já há conexão.
@@ -233,6 +261,18 @@ impl Viewer {
         let _ = self.commands.send(Command::SelectDisplay(index));
     }
 
+    /// Envia um arquivo ao host. O andamento chega como `ViewerEvent::File`.
+    pub fn send_file(&self, path: PathBuf) {
+        let _ = self.commands.send(Command::SendFile(path));
+    }
+
+    /// Responde a um arquivo oferecido pelo host (`FileState::Offered`).
+    pub fn answer_file(&self, id: u64, accept: bool) {
+        if let Some(reply) = self.offers.lock().unwrap().remove(&id) {
+            let _ = reply.send(accept);
+        }
+    }
+
     /// Pede para bloquear a estação remota.
     pub fn lock_remote(&self) {
         let _ = self.commands.send(Command::Lock);
@@ -255,15 +295,94 @@ struct Task {
     device_name: String,
     wants: Permissions,
     frame: Arc<Mutex<SharedFrame>>,
+    out: Emitter,
+    link: Arc<Mutex<Option<quinn::Connection>>>,
+    /// Onde gravar o que o host enviar. `None`: não recebe arquivos.
+    files_dir: Option<PathBuf>,
+    offers: Offers,
+    next_file: Arc<AtomicU64>,
+}
+
+/// Leva eventos até a interface e a acorda. Barato de clonar, para as tarefas
+/// de arquivo, que vivem à parte do laço da sessão.
+#[derive(Clone)]
+struct Emitter {
     events: mpsc::UnboundedSender<ViewerEvent>,
     wake: Wake,
-    link: Arc<Mutex<Option<quinn::Connection>>>,
+}
+
+impl Emitter {
+    fn emit(&self, event: ViewerEvent) {
+        let _ = self.events.send(event);
+        (self.wake)();
+    }
 }
 
 impl Task {
     fn emit(&self, event: ViewerEvent) {
-        let _ = self.events.send(event);
-        (self.wake)();
+        self.out.emit(event);
+    }
+
+    /// Envia um arquivo ao host, numa tarefa à parte.
+    fn send_file(&self, conn: &quinn::Connection, allowed: bool, path: PathBuf) {
+        let id = self.next_file.fetch_add(1, Ordering::Relaxed);
+        let (conn, out) = (conn.clone(), self.out.clone());
+        tokio::spawn(async move {
+            let report = |name: &str, size: u64, state: FileState| {
+                out.emit(ViewerEvent::File(FileEvent { id, incoming: false, name: name.to_string(), size, state }));
+            };
+            let shown = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+            let (name, size) = match files::describe(&path) {
+                Ok(described) => described,
+                Err(err) => return report(&shown, 0, FileState::Failed(format!("{err:#}"))),
+            };
+            if !allowed {
+                let why = "O computador remoto não permite transferência de arquivos nesta sessão.";
+                return report(&name, size, FileState::Failed(why.into()));
+            }
+            report(&name, size, FileState::Progress(0));
+            let sent =
+                files::send(&conn, &path, &name, size, |done| report(&name, size, FileState::Progress(done))).await;
+            report(
+                &name,
+                size,
+                match sent {
+                    Ok(files::Sent::Delivered) => FileState::Done(path.clone()),
+                    Ok(files::Sent::Refused) => FileState::Refused,
+                    Err(err) => FileState::Failed(format!("{err:#}")),
+                },
+            );
+        });
+    }
+
+    /// Trata um arquivo oferecido pelo host. Diferente do host, quem vê
+    /// decide arquivo a arquivo: o computador remoto não manda neste.
+    fn receive_file(&self, allowed: bool, mut tx: quinn::SendStream, mut rx: quinn::RecvStream) {
+        let (out, offers, dir) = (self.out.clone(), self.offers.clone(), self.files_dir.clone());
+        let id = self.next_file.fetch_add(1, Ordering::Relaxed);
+        tokio::spawn(async move {
+            let Ok((name, size)) = files::read_offer(&mut rx).await else { return };
+            let (true, Some(dir)) = (allowed, dir) else { return files::refuse(&mut tx).await };
+            let report = |state: FileState| {
+                out.emit(ViewerEvent::File(FileEvent { id, incoming: true, name: name.clone(), size, state }));
+            };
+            let (reply, decision) = oneshot::channel();
+            offers.lock().unwrap().insert(id, reply);
+            report(FileState::Offered);
+            let accepted = matches!(tokio::time::timeout(OFFER_TIMEOUT, decision).await, Ok(Ok(true)));
+            offers.lock().unwrap().remove(&id);
+            if !accepted {
+                files::refuse(&mut tx).await;
+                return report(FileState::Refused);
+            }
+            report(FileState::Progress(0));
+            let saved =
+                files::save(&mut tx, &mut rx, &dir, &name, size, |done| report(FileState::Progress(done))).await;
+            report(match saved {
+                Ok(path) => FileState::Done(path),
+                Err(err) => FileState::Failed(format!("{err:#}")),
+            });
+        });
     }
 
     /// Chega até o host: direto no endereço, ou pelo ID via servidor de
@@ -460,6 +579,14 @@ impl Task {
 
         let video = self.receive_video(conn);
 
+        // Cada arquivo que o host envia abre um stream próprio.
+        let incoming_files = async {
+            while let Ok((tx, rx)) = conn.accept_bi().await {
+                self.receive_file(permissions.files, tx, rx);
+            }
+            std::future::pending::<()>().await
+        };
+
         // O que o host manda durante a sessão, além do vídeo.
         let incoming = async {
             loop {
@@ -483,11 +610,11 @@ impl Task {
                     let both_moves = matches!(command, Command::Input(InputEvent::MouseMove { .. }))
                         && matches!(next, Command::Input(InputEvent::MouseMove { .. }));
                     if !both_moves {
-                        send_command(&mut tx, &command).await?;
+                        self.perform(conn, permissions, &mut tx, command).await?;
                     }
                     command = next;
                 }
-                send_command(&mut tx, &command).await?;
+                self.perform(conn, permissions, &mut tx, command).await?;
             }
             // O dono da sessão foi descartado.
             let _ = send_msg(&mut tx, &ViewerMsg::Bye).await;
@@ -504,9 +631,28 @@ impl Task {
                 Err(err) => format!("{err:#}"),
             },
             () = incoming => unreachable!("o laço de entrada só termina com a sessão"),
+            () = incoming_files => unreachable!("só termina com a sessão"),
             closed = conn.closed() => describe_close(&closed),
         };
         Ok(reason)
+    }
+
+    /// Executa um comando da interface durante a sessão.
+    async fn perform(
+        &self,
+        conn: &quinn::Connection,
+        permissions: Permissions,
+        tx: &mut quinn::SendStream,
+        command: Command,
+    ) -> Result<()> {
+        match command {
+            // Arquivos não passam pelo canal de controle.
+            Command::SendFile(path) => {
+                self.send_file(conn, permissions.files, path);
+                Ok(())
+            }
+            other => send_command(tx, &other).await,
+        }
     }
 
     /// Recebe e aplica quadros até a conexão cair; devolve o erro que a parou.
@@ -526,7 +672,7 @@ impl Task {
             if let Err(err) = step.await {
                 return err;
             }
-            (self.wake)();
+            (self.out.wake)();
         }
     }
 
@@ -565,8 +711,9 @@ async fn send_command(tx: &mut quinn::SendStream, command: &Command) -> Result<(
         Command::Clipboard(text) if text.len() <= MAX_CLIPBOARD_TEXT => ViewerMsg::Clipboard(text.clone()),
         Command::SelectDisplay(index) => ViewerMsg::SelectDisplay(*index),
         Command::Lock => ViewerMsg::Lock,
-        // Texto grande demais, ou senha depois de a sessão já ter começado.
-        Command::Clipboard(_) | Command::Password(_) => return Ok(()),
+        // Texto grande demais, senha depois de a sessão já ter começado, ou
+        // arquivo (que tem o seu próprio caminho).
+        Command::Clipboard(_) | Command::Password(_) | Command::SendFile(_) => return Ok(()),
     };
     send_msg(tx, &msg).await.context("enviar comando")
 }
