@@ -46,6 +46,14 @@ O OpenDesk não é "o RustDesk, só que P2P": o RustDesk também conecta ponto a
 
 Portar o OpenDesk para outro sistema é implementar `opendesk-platform` para ele.
 
+## Aparência
+
+A interface é neutra e compacta: cinzas levemente frios, branco suave em vez de branco puro e o azul da marca só na ação principal. As cores, a tipografia (Segoe UI do sistema, sem fontes embutidas) e os componentes ficam em `apps/opendesk/src/theme.rs`; os pares de texto e fundo dos dois temas passam de 4,5:1 de contraste.
+
+A identidade oficial está em `assets/brand/`. O símbolo é desenhado em vetor pelo próprio app; o nome "OpenDesk" é uma máscara em tons de cinza embutida no executável e tingida com a cor do tema. `assets/brand/make_assets.py` regenera essa máscara e o ícone (`apps/opendesk/assets/`), que o `build.rs` embute no `.exe` no Windows.
+
+Para conferir telas sem um segundo computador, builds de desenvolvimento aceitam `OPENDESK_PREVIEW=pedido,acesso,aviso,detalhes`.
+
 ## Identidade e segurança
 
 Na primeira execução o dispositivo gera um par de chaves e um certificado autoassinado. A **impressão digital** (SHA-256 do certificado) é a identidade do dispositivo. O **ID de 9 dígitos** é só um apelido derivado dela, para facilitar a conferência por voz; ele não autentica nada.

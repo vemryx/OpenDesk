@@ -38,7 +38,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 directories = "6"
 clap = { version = "4", features = ["derive", "env"] }
-png = "0.17"
+png = "0.18"
 
 [profile.dev]
 opt-level = 1

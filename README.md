@@ -1,15 +1,25 @@
-# OpenDesk
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/logo-dark.png">
+    <img src="assets/brand/logo.png" alt="OpenDesk" width="300">
+  </picture>
+</h1>
 
 Acesso remoto ponto a ponto, gratuito e de código aberto. Uma alternativa ao AnyDesk sem conta, sem anúncios, sem limite de tempo e sem servidor no meio da sua conexão.
 
 > **Estado: MVP.** Funciona entre computadores Windows: por ID pela internet, ou por endereço na mesma rede. A conexão entre duas redes diferentes ainda não foi testada em campo. Veja [o que falta](docs/ARCHITECTURE.md#roteiro).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/app-dark.png">
+  <img src="docs/images/app-light.png" alt="Tela inicial do OpenDesk: o ID deste computador à esquerda e, à direita, o campo para acessar outro computador" width="720">
+</picture>
 
 ## O que já funciona
 
 - Compartilhar a tela e controlar mouse e teclado de outro computador Windows.
 - **Conexão por ID**: um servidor de encontro apresenta os dois computadores e eles conectam direto um ao outro, perfurando o NAT. O servidor nunca vê a sessão.
 - **Relay opcional**: se a rede não deixar conectar direto, a sessão passa por um relay que você mesmo hospeda. Ele só repassa pacotes cifrados e não consegue ler nada.
-- **Transparência**: a barra da sessão mostra a rota (direta por endereço, rede local, ponto a ponto ou via relay), a latência, o codec, a resolução, os quadros por segundo e o bitrate.
+- **Transparência**: a barra da sessão mostra a rota (direta por endereço, rede local, ponto a ponto ou via relay), a latência, os quadros por segundo e o bitrate; codec e resolução aparecem ao passar o ponteiro.
 - **Autorização explícita**: toda conexão precisa ser aprovada por quem está no computador, que escolhe entre só ver ou permitir controle. A sessão ativa fica sempre visível e pode ser encerrada com um clique.
 - **Cifragem de ponta a ponta**: QUIC com TLS 1.3 e identidade criptográfica por dispositivo. Não há servidor que possa ler a sessão.
 - Imagem sem perdas para texto e interface, JPEG para foto e vídeo, com refinamento automático quando a tela para.
@@ -17,7 +27,9 @@ Acesso remoto ponto a ponto, gratuito e de código aberto. Uma alternativa ao An
 
 ## Usar
 
-No computador que será acessado, abra o OpenDesk e informe a quem vai acessar o **ID** (ou o endereço) que aparece em "Este computador". No outro computador, digite-o em "Acessar outro computador" e clique em **Conectar**. O primeiro computador mostra o pedido; aprove.
+No computador que será acessado, abra o OpenDesk e informe a quem vai acessar o **ID** (ou o endereço) que aparece em "ID deste computador". No outro computador, digite-o em "Acessar outro computador" e clique em **Conectar**. O primeiro computador mostra o pedido; aprove. A janela, compacta na tela inicial, maximiza-se durante a sessão e volta ao tamanho normal quando ela termina.
+
+O app segue o tema claro ou escuro do Windows; `OPENDESK_THEME=light` ou `dark` fixa um deles.
 
 O ID vem do servidor de encontro do projeto. Para usar o seu, defina a variável de ambiente `OPENDESK_RENDEZVOUS` com o endereço dele (por exemplo `wss://seu-servidor.workers.dev`) antes de abrir o OpenDesk; `OPENDESK_RENDEZVOUS=off` desliga o servidor e deixa só a conexão por endereço.
 

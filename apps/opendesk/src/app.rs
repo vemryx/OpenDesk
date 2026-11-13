@@ -1,9 +1,10 @@
 //! Estado e telas do aplicativo.
 //!
-//! Uma janela só: a tela inicial (este computador + conectar a outro) dá
-//! lugar à visão remota quando uma sessão de saída é autorizada. Pedidos de
-//! entrada aparecem como diálogo modal por cima de qualquer tela, e uma sessão
-//! de entrada ativa fica sempre anunciada numa faixa no topo.
+//! Uma janela só, compacta: a tela inicial (o ID deste computador ao lado do
+//! campo para acessar outro) dá lugar à visão remota, em janela maximizada,
+//! quando uma sessão de saída é autorizada. Pedidos de entrada aparecem como
+//! diálogo modal por cima de qualquer tela, e uma sessão de entrada ativa fica
+//! sempre anunciada numa faixa no topo.
 
 use crate::theme::{self, Palette};
 use anyhow::{Context as _, Result};
@@ -27,12 +28,26 @@ use tokio::sync::{mpsc, oneshot};
 /// O host desiste do pedido depois deste tempo (ver `opendesk-session`).
 const REQUEST_TTL: Duration = Duration::from_secs(60);
 
+/// Tamanho da janela na tela inicial.
+pub const HOME_SIZE: [f32; 2] = [720.0, 360.0];
+/// Largura do conteúdo da coluna "este computador".
+const SIDE_WIDTH: f32 = 232.0;
+/// Altura do símbolo da marca e o respiro abaixo dele. A coluna da direita
+/// desce o mesmo tanto, para os rótulos das duas colunas ficarem alinhados.
+const LOGO_HEIGHT: f32 = 26.0;
+const LOGO_GAP: f32 = 26.0;
+/// Largura do botão ao lado do campo (igual para "Conectar" e "Cancelar",
+/// para o campo não mudar de tamanho entre os estados).
+const ACTION_WIDTH: f32 = 104.0;
+
 pub struct App {
     runtime: tokio::runtime::Runtime,
     node: Arc<Node>,
     host: Arc<Host>,
     host_events: mpsc::UnboundedReceiver<HostEvent>,
     wake: Wake,
+    ctx: egui::Context,
+    logo: theme::Logo,
     device_name: String,
     local_address: String,
     /// Busca por ID; `None` quando não há servidor de encontro configurado.
@@ -47,6 +62,12 @@ pub struct App {
     outgoing: Option<Outgoing>,
     notice: Option<String>,
     copied_at: Option<Instant>,
+    /// A janela foi maximizada pelo app ao entrar na sessão (e não pela pessoa).
+    maximized_for_session: bool,
+    /// Em testes (`OPENDESK_WINDOW_POS`), a janela nunca toma o foco nem se maximiza.
+    quiet: bool,
+    #[cfg(debug_assertions)]
+    preview_details: std::cell::Cell<bool>,
 
     keyboard: Option<KeyboardGrab>,
     key_target: Arc<Mutex<Option<InputSender>>>,
@@ -184,6 +205,8 @@ impl App {
             host,
             host_events,
             wake,
+            ctx: cc.egui_ctx.clone(),
+            logo: theme::Logo::load(),
             device_name,
             local_address,
             lookup,
@@ -195,9 +218,15 @@ impl App {
             outgoing: None,
             notice: None,
             copied_at: None,
+            maximized_for_session: false,
+            quiet: std::env::var_os("OPENDESK_WINDOW_POS").is_some(),
+            #[cfg(debug_assertions)]
+            preview_details: Default::default(),
             keyboard,
             key_target,
         };
+        #[cfg(debug_assertions)]
+        app.preview();
         // `opendesk <ID ou endereço>` conecta direto ao abrir.
         if let Some(target) = std::env::args().nth(1) {
             app.address = target;
@@ -208,6 +237,42 @@ impl App {
 
     fn identity(&self) -> &Identity {
         self.node.identity()
+    }
+
+    /// Só em builds de desenvolvimento: `OPENDESK_PREVIEW=pedido,acesso,aviso,detalhes`
+    /// abre o app já com esses estados na tela, para conferir o visual sem
+    /// precisar de um segundo computador. O pedido falso não leva a lugar nenhum.
+    #[cfg(debug_assertions)]
+    fn preview(&mut self) {
+        let Ok(states) = std::env::var("OPENDESK_PREVIEW") else { return };
+        let fingerprint = self.identity().fingerprint();
+        let peer = || PeerInfo {
+            name: "NOTEBOOK-ANA".into(),
+            fingerprint,
+            addr: SocketAddr::from(([203, 0, 113, 24], 47700)),
+            relay: None,
+            wants: Permissions::FULL,
+        };
+        for state in states.split(',') {
+            match state.trim() {
+                "pedido" => {
+                    let (reply, _) = oneshot::channel();
+                    self.requests.push(Request { session: 0, peer: peer(), reply, since: Instant::now() });
+                }
+                "acesso" => self.inbound.push(Inbound {
+                    session: 0,
+                    peer: peer(),
+                    permissions: Permissions::FULL,
+                    since: Instant::now(),
+                }),
+                "aviso" => {
+                    self.notice =
+                        Some("O computador 602 758 973 não está online. Confira o ID e tente de novo.".into());
+                }
+                "detalhes" => self.preview_details.set(true),
+                _ => {}
+            }
+        }
     }
 
     /// Interpreta o que foi digitado: um ID de 9 dígitos ou um endereço.
@@ -269,6 +334,10 @@ impl App {
         }
         self.outgoing = None;
         self.notice = notice;
+        // Fim da sessão: a janela volta ao tamanho compacto da tela inicial.
+        if std::mem::take(&mut self.maximized_for_session) {
+            self.ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+        }
     }
 
     fn pump(&mut self, ctx: &egui::Context) {
@@ -277,8 +346,10 @@ impl App {
                 HostEvent::Request { session, peer, reply } => {
                     self.requests.push(Request { session, peer, reply, since: Instant::now() });
                     // Um pedido de acesso não pode passar despercebido.
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    if !self.quiet {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
                 }
                 HostEvent::Started { session, peer, permissions } => {
                     self.inbound.push(Inbound { session, peer, permissions, since: Instant::now() });
@@ -291,6 +362,7 @@ impl App {
         }
 
         let mut closed = None;
+        let mut granted = false;
         if let Some(out) = &mut self.outgoing {
             while let Ok(event) = out.events.try_recv() {
                 match event {
@@ -302,6 +374,7 @@ impl App {
                     }
                     ViewerEvent::Granted { permissions, .. } => {
                         out.stage = Stage::Live { permissions };
+                        granted = true;
                         if permissions.control {
                             *self.key_target.lock().unwrap() = Some(out.viewer.input_sender());
                         }
@@ -310,6 +383,12 @@ impl App {
                     ViewerEvent::Closed(reason) => closed = Some(reason),
                 }
             }
+        }
+        // A tela remota precisa de espaço: a sessão abre com a janela maximizada.
+        let large = ctx.input(|i| i.viewport().maximized == Some(true) || i.viewport().fullscreen == Some(true));
+        if granted && !large && !self.quiet {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            self.maximized_for_session = true;
         }
         if let Some(reason) = closed {
             self.end_outgoing(Some(reason));
@@ -340,11 +419,9 @@ impl eframe::App for App {
         if live {
             self.session_bar(ui, &p);
             self.inbound_banner(ui, &p);
-            self.remote_screen(ui);
+            self.remote_screen(ui, &p);
         } else {
-            self.header(ui, &p);
             self.inbound_banner(ui, &p);
-            self.footer(ui, &p);
             self.home(ui, &p);
         }
         self.request_dialog(ui.ctx(), &p);
@@ -360,71 +437,23 @@ impl eframe::App for App {
 // ───────────────────────────── Tela inicial ─────────────────────────────
 
 impl App {
-    fn header(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        egui::Panel::top("header")
-            .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin { left: 28, right: 28, top: 20, bottom: 8 }))
-            .show_separator_line(false)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("OpenDesk").font(theme::semibold(20.0)).color(p.text));
-                    let (color, status) = match (&self.lookup, &*self.presence.lock().unwrap()) {
-                        (None, _) => (p.accent, "Pronto para conexões por endereço"),
-                        (Some(_), Presence::Online { .. }) => (p.accent, "Online · pronto para receber conexões"),
-                        (Some(_), Presence::Connecting) => (p.muted, "Entrando no servidor de encontro…"),
-                        (Some(_), Presence::Offline(_)) => (p.danger, "Sem servidor de encontro · só por endereço"),
-                    };
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(theme::muted(status, p));
-                        theme::dot(ui, color);
-                    });
-                });
-            });
-    }
-
-    fn footer(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        egui::Panel::bottom("footer")
-            .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin { left: 28, right: 28, top: 8, bottom: 16 }))
-            .show_separator_line(false)
-            .show(ui, |ui| {
-                ui.label(
-                    theme::muted(
-                        format!(
-                            "OpenDesk {} · código aberto (Apache-2.0) · conexões cifradas de ponta a ponta",
-                            env!("CARGO_PKG_VERSION")
-                        ),
-                        p,
-                    )
-                    .small(),
-                );
-            });
-    }
-
     fn home(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let margin = |x: i8| Margin { left: x, right: x, top: 20, bottom: 14 };
+        egui::Panel::left("side")
+            .exact_size(SIDE_WIDTH)
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(p.side).inner_margin(margin(22)))
+            .show(ui, |ui| self.this_computer(ui, p));
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin { left: 28, right: 28, top: 12, bottom: 8 }))
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.x = 20.0;
-                let height = ui.available_height();
-                ui.columns(2, |columns| {
-                    for (column, right) in columns.iter_mut().zip([false, true]) {
-                        theme::card(p).show(column, |ui| {
-                            // As colunas justificam o conteúdo; dentro do
-                            // cartão o alinhamento é o natural, à esquerda.
-                            let size = Vec2::new(ui.available_width(), height - 50.0);
-                            ui.allocate_ui_with_layout(size, Layout::top_down(Align::Min), |ui| {
-                                ui.set_min_size(size);
-                                if right { self.connect_form(ui, p) } else { self.this_computer(ui, p) }
-                            });
-                        });
-                    }
-                });
-            });
+            .frame(egui::Frame::new().fill(p.bg).inner_margin(margin(28)))
+            .show(ui, |ui| self.connect_form(ui, p));
     }
 
     fn this_computer(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        ui.spacing_mut().item_spacing.x = 10.0;
-        theme::caption(ui, p, "ESTE COMPUTADOR");
-        ui.add_space(6.0);
+        self.logo.show(ui, p, LOGO_HEIGHT);
+        ui.add_space(LOGO_GAP);
+        ui.spacing_mut().item_spacing.y = 6.0;
 
         // Com servidor de encontro, o que se compartilha é o ID; sem ele, o
         // endereço na rede.
@@ -434,27 +463,19 @@ impl App {
             Presence::Online { id, nat } if by_id => Some((*id, *nat)),
             _ => None,
         };
-        let (title, value, copy) = match (by_id, online) {
-            (true, Some((id, _))) => ("Seu ID", Some(id.to_string()), "Copiar ID"),
-            (true, None) => ("Seu ID", None, "Copiar ID"),
-            (false, _) => ("Endereço para conexão", Some(self.local_address.clone()), "Copiar endereço"),
+        let (title, value, copy, what) = match (by_id, online) {
+            (true, Some((id, _))) => ("ID deste computador", Some(id.to_string()), "Copiar ID", "este ID"),
+            (true, None) => ("ID deste computador", None, "Copiar ID", "este ID"),
+            (false, _) => {
+                ("Endereço deste computador", Some(self.local_address.clone()), "Copiar endereço", "este endereço")
+            }
         };
-        ui.label(theme::muted(title, p));
-        let shown = value.as_deref().unwrap_or("— — —");
+        theme::section(ui, p, title);
+        let font = theme::semibold(if by_id { 28.0 } else { 17.0 });
         let color = if value.is_some() { p.text } else { p.muted };
-        let size = if by_id { 34.0 } else { 28.0 };
-        ui.add(egui::Label::new(RichText::new(shown).font(theme::semibold(size)).color(color)).selectable(true));
-        match &presence {
-            Presence::Connecting if by_id => {
-                ui.label(theme::muted("Entrando no servidor de encontro…", p).small());
-            }
-            Presence::Offline(reason) if by_id => {
-                ui.label(theme::muted("Sem contato com o servidor de encontro. Tentando de novo…", p).small())
-                    .on_hover_text(reason);
-            }
-            _ => {}
-        }
-        ui.add_space(2.0);
+        let shown = value.as_deref().unwrap_or("··· ··· ···");
+        ui.add(egui::Label::new(RichText::new(shown).font(font).color(color)).selectable(value.is_some()));
+
         let just_copied = self.copied_at.is_some_and(|at| at.elapsed() < Duration::from_secs(2));
         if !just_copied {
             self.copied_at = None;
@@ -466,109 +487,132 @@ impl App {
             ui.ctx().copy_text(value);
             self.copied_at = Some(Instant::now());
         }
-
-        ui.add_space(8.0);
-        ui.separator();
         ui.add_space(4.0);
-        let fingerprint = self.identity().fingerprint();
-        egui::Grid::new("identity").num_columns(2).spacing([18.0, 6.0]).min_row_height(22.0).show(ui, |ui| {
-            theme::detail(ui, p, "Nome", &self.device_name);
-            if by_id {
-                theme::detail(ui, p, "Endereço na rede", &self.local_address);
-            } else {
-                theme::detail(ui, p, "ID do dispositivo", &fingerprint.device_id().to_string());
-            }
-            theme::detail(ui, p, "Impressão digital", &fingerprint.short());
-        });
+        ui.label(theme::muted(format!("Passe {what} para quem vai acessar. Você aprova cada conexão."), p).small());
 
-        ui.add_space(8.0);
-        let what = if by_id { "o ID" } else { "o endereço" };
-        ui.label(
-            theme::muted(
-                format!(
-                    "Passe {what} para quem vai acessar este computador. Nenhuma conexão começa sem você aprovar aqui."
+        ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+            self.status_row(ui, p, by_id, &presence, online.map(|(_, nat)| nat));
+        });
+    }
+
+    /// Rodapé da coluna: o estado da presença e, sob demanda, os detalhes de
+    /// identidade que a maioria das pessoas nunca precisa ver.
+    fn status_row(&self, ui: &mut egui::Ui, p: &Palette, by_id: bool, presence: &Presence, nat: Option<Nat>) {
+        ui.horizontal(|ui| {
+            let (color, status, hint) = match (by_id, presence) {
+                (false, _) => (
+                    p.muted,
+                    "Só por endereço",
+                    Some("Nenhum servidor de encontro configurado. Este computador é acessível pelo endereço, na mesma rede."),
                 ),
-                p,
-            )
-            .small(),
-        );
-        if matches!(online, Some((_, Nat::Symmetric))) {
-            ui.label(
-                RichText::new(
-                    "Sua rede usa NAT simétrico: conexões vindas da internet podem falhar enquanto o relay não existir.",
-                )
-                .small()
-                .color(p.alert_text),
-            );
-        }
+                (true, Presence::Online { .. }) => (p.ok, "Online", None),
+                (true, Presence::Connecting) => (p.muted, "Conectando…", None),
+                (true, Presence::Offline(reason)) => (p.danger, "Reconectando…", Some(reason.as_str())),
+            };
+            theme::dot(ui, color);
+            let label = ui.label(theme::muted(status, p).small());
+            if let Some(hint) = hint {
+                label.on_hover_text(hint);
+            }
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.visuals_mut().hyperlink_color = p.muted;
+                let details = ui.link(RichText::new("Detalhes").small());
+                #[cfg(debug_assertions)]
+                if self.preview_details.take() {
+                    egui::Popup::open_id(ui.ctx(), egui::Popup::default_response_id(&details));
+                }
+                egui::Popup::from_toggle_button_response(&details)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| {
+                        let fingerprint = self.identity().fingerprint();
+                        egui::Grid::new("identity").num_columns(2).spacing([16.0, 6.0]).min_row_height(18.0).show(ui, |ui| {
+                            theme::detail(ui, p, "Nome", &self.device_name);
+                            if by_id {
+                                theme::detail(ui, p, "Endereço na rede", &self.local_address);
+                            } else {
+                                theme::detail(ui, p, "ID", &fingerprint.device_id().to_string());
+                            }
+                            theme::detail(ui, p, "Impressão digital", &fingerprint.short());
+                        });
+                        if nat == Some(Nat::Symmetric) {
+                            ui.set_max_width(300.0);
+                            ui.label(
+                                theme::muted(
+                                    "Sua rede troca a porta a cada destino (NAT simétrico). Conexões vindas da internet podem precisar passar por um relay.",
+                                    p,
+                                )
+                                .small(),
+                            );
+                        }
+                    });
+            });
+        });
     }
 
     fn connect_form(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        ui.spacing_mut().item_spacing.x = 10.0;
-        theme::caption(ui, p, "ACESSAR OUTRO COMPUTADOR");
-        ui.add_space(6.0);
+        // Mesma descida da coluna ao lado: marca, espaçamento entre itens e respiro.
+        ui.add_space(LOGO_HEIGHT + ui.spacing().item_spacing.y + LOGO_GAP);
+        ui.spacing_mut().item_spacing.y = 6.0;
 
         let busy = self.outgoing.is_some();
         let by_id = self.lookup.is_some();
-        let label = ui.label(theme::muted(
-            if by_id { "ID ou endereço do computador remoto" } else { "Endereço do computador remoto" },
-            p,
-        ));
-        let field = ui.add_enabled(
-            !busy,
-            egui::TextEdit::singleline(&mut self.address)
-                .hint_text(if by_id { "602 758 973" } else { "192.168.0.10" })
-                .font(egui::FontId::proportional(17.0))
-                .margin(Margin::symmetric(12, 10))
-                .desired_width(f32::INFINITY),
-        );
-        let field = field.labelled_by(label.id);
-        let submitted = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let label = theme::section(ui, p, "Acessar outro computador");
 
-        ui.add_enabled(!busy, egui::Checkbox::new(&mut self.want_control, "Pedir controle de mouse e teclado"));
-        ui.add_space(4.0);
+        let (mut connect, mut cancel) = (false, false);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().interact_size.y = 36.0;
+            let width = ui.available_width() - ACTION_WIDTH - ui.spacing().item_spacing.x;
+            let field = ui
+                .add_enabled(
+                    !busy,
+                    egui::TextEdit::singleline(&mut self.address)
+                        .hint_text(if by_id { "ID ou endereço" } else { "Endereço, como 192.168.0.10" })
+                        .font(egui::FontId::proportional(15.0))
+                        .margin(Margin::symmetric(10, 8))
+                        .desired_width(width),
+                )
+                .labelled_by(label.id);
+            let submitted = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if busy {
+                cancel = ui.add(egui::Button::new("Cancelar").min_size(Vec2::new(ACTION_WIDTH, 36.0))).clicked();
+            } else {
+                let ready = !self.address.trim().is_empty();
+                connect =
+                    theme::primary_button(ui, p, "Conectar", ready, ACTION_WIDTH).clicked() || (submitted && ready);
+            }
+        });
+        ui.add_space(2.0);
+        ui.add_enabled(!busy, egui::Checkbox::new(&mut self.want_control, "Controlar mouse e teclado"));
 
-        if busy {
-            let (status, cancel) = match self.outgoing.as_ref().map(|o| (&o.stage, o)) {
-                Some((Stage::Connecting, out)) if out.by_id => (format!("Procurando {}…", out.target), "Cancelar"),
-                Some((Stage::Connecting, out)) => (format!("Conectando a {}…", out.target), "Cancelar"),
-                Some((_, out)) => (format!("Aguardando {} autorizar o acesso…", out.host_name), "Cancelar pedido"),
-                None => (String::new(), "Cancelar"),
+        if let Some(out) = &self.outgoing {
+            let status = match out.stage {
+                Stage::Connecting if out.by_id => format!("Procurando {}…", out.target),
+                Stage::Connecting => format!("Conectando a {}…", out.target),
+                _ => format!("Aguardando {} autorizar o acesso…", out.host_name),
             };
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(18.0).color(p.accent));
+                ui.add(egui::Spinner::new().size(14.0).color(p.accent_text));
                 ui.label(RichText::new(status).color(p.text));
             });
-            if let Some(fingerprint) = self.outgoing.as_ref().and_then(|o| o.fingerprint) {
+            // Quem está do outro lado: dá para conferir antes de a sessão abrir.
+            if let Some(fingerprint) = out.fingerprint {
                 ui.label(
                     theme::muted(
-                        format!("ID {} · impressão digital {}", fingerprint.device_id(), fingerprint.short()),
+                        format!("ID {}, impressão digital {}", fingerprint.device_id(), fingerprint.short()),
                         p,
                     )
                     .small(),
                 );
             }
-            if ui.button(cancel).clicked() {
-                self.end_outgoing(None);
-            }
-        } else {
-            let ready = !self.address.trim().is_empty();
-            let clicked = ui
-                .with_layout(Layout::top_down_justified(Align::Center), |ui| {
-                    ui.add_enabled(ready, theme::primary_button(p, "Conectar").min_size(Vec2::new(0.0, 40.0))).clicked()
-                })
-                .inner;
-            if clicked || (submitted && ready) {
-                self.connect();
-            }
         }
-
         if let Some(notice) = &self.notice {
-            ui.add_space(4.0);
+            ui.add_space(6.0);
             egui::Frame::new()
                 .fill(p.control)
-                .corner_radius(CornerRadius::same(8))
-                .inner_margin(Margin::symmetric(12, 10))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::symmetric(10, 8))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.label(RichText::new(notice).color(p.text));
@@ -576,18 +620,24 @@ impl App {
         }
 
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-            ui.label(
-                theme::muted(
-                    if by_id {
-                        "Com o ID, o OpenDesk localiza o outro computador e conecta direto a ele, ponto a ponto. O endereço (ex.: 192.168.0.10) também funciona, na mesma rede."
-                    } else {
-                        "Nenhum servidor de encontro configurado: a conexão é direta, por endereço. Os dois computadores precisam estar na mesma rede (ou com a porta encaminhada)."
-                    },
-                    p,
-                )
-                .small(),
-            );
+            ui.horizontal(|ui| {
+                let promise = if by_id {
+                    "Conexão direta, cifrada de ponta a ponta."
+                } else {
+                    "Sem servidor de encontro: conexão por endereço, na mesma rede."
+                };
+                ui.label(theme::muted(promise, p).small());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(theme::muted(concat!("v", env!("CARGO_PKG_VERSION")), p).small());
+                });
+            });
         });
+
+        if cancel {
+            self.end_outgoing(None);
+        } else if connect {
+            self.connect();
+        }
     }
 }
 
@@ -601,7 +651,7 @@ impl App {
         }
         let mut end = None;
         egui::Panel::top("inbound")
-            .frame(egui::Frame::new().fill(p.alert_bg).inner_margin(Margin::symmetric(28, 8)))
+            .frame(egui::Frame::new().fill(p.alert_bg).inner_margin(Margin::symmetric(16, 6)))
             .show_separator_line(false)
             .show(ui, |ui| {
                 for session in &self.inbound {
@@ -610,15 +660,11 @@ impl App {
                         let verb = if session.permissions.control { "está controlando" } else { "está vendo" };
                         let secs = session.since.elapsed().as_secs();
                         ui.label(
-                            RichText::new(format!(
-                                "{} {verb} este computador · {:02}:{:02}",
-                                session.peer.name,
-                                secs / 60,
-                                secs % 60
-                            ))
-                            .font(theme::semibold(14.5))
-                            .color(p.alert_text),
+                            RichText::new(format!("{} {verb} este computador", session.peer.name))
+                                .font(theme::semibold(13.5))
+                                .color(p.alert_text),
                         );
+                        ui.label(RichText::new(format!("{:02}:{:02}", secs / 60, secs % 60)).color(p.alert_text));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui.button("Encerrar acesso").clicked() {
                                 end = Some(session.session);
@@ -641,20 +687,20 @@ impl App {
         let frame = egui::Frame::new()
             .fill(p.surface)
             .stroke(Stroke::new(1.0, p.border))
-            .corner_radius(CornerRadius::same(16))
-            .inner_margin(Margin::same(28));
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::same(20))
+            .shadow(ctx.style_of(ctx.theme()).visuals.window_shadow);
         egui::Modal::new(egui::Id::unique("access-request")).frame(frame).show(ctx, |ui| {
-            ui.set_width(460.0);
-            theme::caption(ui, p, "PEDIDO DE ACESSO");
+            ui.set_width(400.0);
             let wants = if peer.wants.control { "ver e controlar" } else { "ver a tela de" };
             ui.label(
                 RichText::new(format!("{} quer {wants} este computador", peer.name))
-                    .font(theme::semibold(21.0))
+                    .font(theme::semibold(16.0))
                     .color(p.text),
             );
-            ui.add_space(4.0);
-            egui::Grid::new("request").num_columns(2).spacing([18.0, 6.0]).min_row_height(22.0).show(ui, |ui| {
-                theme::detail(ui, p, "ID do dispositivo", &peer.fingerprint.device_id().to_string());
+            ui.add_space(2.0);
+            egui::Grid::new("request").num_columns(2).spacing([16.0, 6.0]).min_row_height(18.0).show(ui, |ui| {
+                theme::detail(ui, p, "ID", &peer.fingerprint.device_id().to_string());
                 theme::detail(ui, p, "Impressão digital", &peer.fingerprint.short());
                 let network = match peer.relay {
                     Some(relay) => format!("via relay {relay}"),
@@ -662,20 +708,12 @@ impl App {
                 };
                 theme::detail(ui, p, "Endereço de rede", &network);
             });
-            ui.add_space(4.0);
-            egui::Frame::new()
-                .fill(p.alert_bg)
-                .corner_radius(CornerRadius::same(8))
-                .inner_margin(Margin::symmetric(12, 10))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(
-                        RichText::new(
-                            "Só aceite se você conhece quem está pedindo e estava esperando por isso. Bancos, lojas e suporte técnico de verdade não pedem acesso ao seu computador por telefone.",
-                        )
-                        .color(p.alert_text),
-                    );
-                });
+            ui.add_space(2.0);
+            theme::alert(
+                ui,
+                p,
+                "Só aceite se você conhece quem está pedindo e estava esperando por isso. Bancos, lojas e suporte técnico de verdade não pedem acesso ao seu computador por telefone.",
+            );
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button("Recusar").clicked() {
@@ -684,13 +722,13 @@ impl App {
                 ui.label(theme::muted(format!("expira em {remaining} s"), p).small());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if peer.wants.control {
-                        if ui.add(theme::primary_button(p, "Permitir controle")).clicked() {
+                        if theme::primary_button(ui, p, "Permitir controle", true, 0.0).clicked() {
                             answer = Some(Some(Permissions::FULL));
                         }
                         if ui.button("Somente ver").clicked() {
                             answer = Some(Some(Permissions::VIEW_ONLY));
                         }
-                    } else if ui.add(theme::primary_button(p, "Permitir ver")).clicked() {
+                    } else if theme::primary_button(ui, p, "Permitir ver", true, 0.0).clicked() {
                         answer = Some(Some(Permissions::VIEW_ONLY));
                     }
                 });
@@ -713,17 +751,17 @@ impl App {
         out.stats.sample(&out.viewer);
         let mut end = false;
         egui::Panel::top("session-bar")
-            .frame(egui::Frame::new().fill(p.surface).inner_margin(Margin::symmetric(16, 8)))
+            .frame(egui::Frame::new().fill(p.side).inner_margin(Margin::symmetric(14, 6)))
             .show_separator_line(false)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    theme::dot(ui, p.accent);
-                    ui.label(RichText::new(&out.host_name).font(theme::semibold(14.5)).color(p.text));
+                    theme::dot(ui, p.ok);
+                    ui.label(RichText::new(&out.host_name).font(theme::semibold(13.5)).color(p.text));
                     // Transparência: por onde a sessão passa e com que atraso.
                     if let Some(route) = out.route {
                         let latency = match out.viewer.rtt() {
-                            Some(rtt) if rtt < Duration::from_millis(1) => " · <1 ms".to_string(),
-                            Some(rtt) => format!(" · {} ms", rtt.as_millis()),
+                            Some(rtt) if rtt < Duration::from_millis(1) => ", menos de 1 ms".to_string(),
+                            Some(rtt) => format!(", {} ms", rtt.as_millis()),
                             None => String::new(),
                         };
                         let explanation = match route {
@@ -737,27 +775,19 @@ impl App {
                         ui.label(theme::muted(format!("{}{latency}", route.label()), p).small())
                             .on_hover_text(explanation);
                     }
-                    let roomy = ui.available_width() > 620.0;
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.button("Encerrar").clicked() {
                             end = true;
                         }
                         let mode = if permissions.control { "Controle ativo" } else { "Somente visualização" };
-                        ui.label(RichText::new(mode).color(p.text));
+                        ui.label(theme::muted(mode, p).small());
+                        ui.add_space(8.0);
+                        // Transparência sem ruído: o essencial na barra, o resto no ponteiro.
                         ui.label(
-                            theme::muted(
-                                if roomy {
-                                    format!(
-                                        "Tiles v1 · {}×{} · {:.0} qps · {:.1} Mbit/s",
-                                        out.size[0], out.size[1], out.stats.fps, out.stats.mbps
-                                    )
-                                } else {
-                                    format!("{:.0} qps · {:.1} Mbit/s", out.stats.fps, out.stats.mbps)
-                                },
-                                p,
-                            )
-                            .small(),
-                        );
+                            theme::muted(format!("{:.0} quadros/s   {:.1} Mbit/s", out.stats.fps, out.stats.mbps), p)
+                                .small(),
+                        )
+                        .on_hover_text(format!("Tela de {}×{}, codec Tiles v1", out.size[0], out.size[1]));
                     });
                 });
             });
@@ -766,10 +796,10 @@ impl App {
         }
     }
 
-    fn remote_screen(&mut self, ui: &mut egui::Ui) {
+    fn remote_screen(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let Some(out) = &mut self.outgoing else { return };
         let Stage::Live { permissions } = out.stage else { return };
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(9, 10, 10))).show(ui, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.stage)).show(ui, |ui| {
             out.sync_texture(ui.ctx());
             let area = ui.available_rect_before_wrap();
             ui.allocate_rect(area, Sense::click_and_drag());
