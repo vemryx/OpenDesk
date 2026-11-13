@@ -14,6 +14,8 @@ Acesso remoto ponto a ponto, gratuito e de código aberto. Uma alternativa ao An
   <img src="docs/images/app-light.png" alt="Tela inicial do OpenDesk: o ID deste computador à esquerda e, à direita, o campo para acessar outro computador" width="720">
 </picture>
 
+<img src="docs/images/settings-dark.png" alt="Configurações de segurança: aceitar pedidos de acesso, permitir controle de mouse e teclado, bloquear o Windows ao fim do acesso" width="720">
+
 ## O que já funciona
 
 - Compartilhar a tela e controlar mouse e teclado de outro computador Windows.
@@ -23,6 +25,9 @@ Acesso remoto ponto a ponto, gratuito e de código aberto. Uma alternativa ao An
 - **Autorização explícita**: toda conexão precisa ser aprovada por quem está no computador, que escolhe entre só ver ou permitir controle. A sessão ativa fica sempre visível e pode ser encerrada com um clique.
 - **Cifragem de ponta a ponta**: QUIC com TLS 1.3 e identidade criptográfica por dispositivo. Não há servidor que possa ler a sessão.
 - Imagem sem perdas para texto e interface, JPEG para foto e vídeo, com refinamento automático quando a tela para.
+- **Computadores recentes** na tela inicial: um clique reconecta.
+- **Configurações** para uso pessoal e para empresas: nome e tema; abrir com o Windows; aceitar ou não pedidos de acesso; limitar quem acessa a "só ver"; bloquear o Windows ao fim do acesso; servidor de encontro e relay próprios; porta.
+- **Histórico de sessões** em arquivo (`history.jsonl`, uma linha JSON por evento), com as sessões feitas e recebidas e os pedidos recusados.
 - Um executável único, sem instalador.
 
 ## Usar
@@ -31,7 +36,7 @@ No computador que será acessado, abra o OpenDesk e informe a quem vai acessar o
 
 O app segue o tema claro ou escuro do Windows; `OPENDESK_THEME=light` ou `dark` fixa um deles.
 
-O ID vem do servidor de encontro do projeto. Para usar o seu, defina a variável de ambiente `OPENDESK_RENDEZVOUS` com o endereço dele (por exemplo `wss://seu-servidor.workers.dev`) antes de abrir o OpenDesk; `OPENDESK_RENDEZVOUS=off` desliga o servidor e deixa só a conexão por endereço.
+O ID vem do servidor de encontro do projeto. Para usar o seu, informe o endereço dele em **Configurações, Rede** (por exemplo `wss://seu-servidor.workers.dev`); lá também dá para desligar o servidor e ficar só com a conexão por endereço. Em implantações, as variáveis de ambiente `OPENDESK_RENDEZVOUS` (`off` desliga), `OPENDESK_RELAY` e `OPENDESK_PORT` fazem o mesmo e têm prioridade sobre a tela.
 
 Na primeira execução o Firewall do Windows pergunta se o OpenDesk pode receber conexões. Permita em redes privadas.
 

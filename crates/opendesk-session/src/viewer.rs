@@ -66,12 +66,18 @@ impl Lookup {
     /// encontro configurado: nesse caso só existe conexão por endereço.
     pub fn from_env(data_dir: &std::path::Path) -> Result<Option<Arc<Self>>> {
         let Some(url) = opendesk_net::rendezvous_url() else { return Ok(None) };
-        Ok(Some(Arc::new(Self {
-            rendezvous: Rendezvous::new(&url)?,
+        Self::new(data_dir, &url, opendesk_net::relay_addr()).map(Some)
+    }
+
+    /// Busca por ID usando o servidor de encontro em `url` e, se informado, o
+    /// relay em `relay` (`host:porta`).
+    pub fn new(data_dir: &std::path::Path, url: &str, relay: Option<String>) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            rendezvous: Rendezvous::new(url)?,
             stun_servers: opendesk_net::DEFAULT_STUN_SERVERS.iter().map(|s| s.to_string()).collect(),
             known: KnownHosts::load(data_dir),
-            relay: opendesk_net::relay_addr(),
-        })))
+            relay,
+        }))
     }
 }
 

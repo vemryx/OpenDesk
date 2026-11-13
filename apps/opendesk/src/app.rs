@@ -6,6 +6,9 @@
 //! diálogo modal por cima de qualquer tela, e uma sessão de entrada ativa fica
 //! sempre anunciada numa faixa no topo.
 
+mod settings;
+
+use crate::config::{Entry, History, Kind, Recents, Settings};
 use crate::theme::{self, Palette};
 use anyhow::{Context as _, Result};
 use eframe::egui::{
@@ -21,6 +24,7 @@ use opendesk_session::host::{Host, HostEvent, PeerInfo};
 use opendesk_session::viewer::{InputSender, Lookup, Route, Target, Viewer, ViewerEvent};
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -32,8 +36,9 @@ const REQUEST_TTL: Duration = Duration::from_secs(60);
 pub const HOME_SIZE: [f32; 2] = [940.0, 600.0];
 /// Largura do conteúdo da coluna "este computador".
 const SIDE_WIDTH: f32 = 264.0;
-/// O formulário não estica além disto em janelas largas.
-const FORM_WIDTH: f32 = 520.0;
+/// Largura máxima do conteúdo da área principal. Formulário, cabeçalho e
+/// linhas de configuração terminam todos nesta mesma borda direita.
+const CONTENT_WIDTH: f32 = 560.0;
 /// Altura do símbolo da marca e o respiro abaixo dele. A coluna da direita
 /// desce o mesmo tanto, para os rótulos das duas colunas ficarem alinhados.
 const LOGO_HEIGHT: f32 = 30.0;
@@ -41,6 +46,29 @@ const LOGO_GAP: f32 = 36.0;
 /// Largura do botão ao lado do campo (igual para "Conectar" e "Cancelar",
 /// para o campo não mudar de tamanho entre os estados).
 const ACTION_WIDTH: f32 = 104.0;
+
+/// O que a área principal mostra.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Home,
+    Settings(Tab),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    General,
+    Security,
+    Network,
+    History,
+    About,
+}
+
+/// O nome com que este computador se apresenta: o das configurações ou, se
+/// estiver vazio, o do sistema.
+fn effective_name(settings: &Settings, system_name: &str) -> String {
+    let name = settings.device_name.trim();
+    if name.is_empty() { system_name.to_string() } else { name.to_string() }
+}
 
 pub struct App {
     runtime: tokio::runtime::Runtime,
@@ -50,11 +78,26 @@ pub struct App {
     wake: Wake,
     ctx: egui::Context,
     logo: theme::Logo,
+    data_dir: PathBuf,
+    settings: Settings,
+    /// Um problema ao gravar ou aplicar configurações, mostrado na tela delas.
+    settings_problem: Option<String>,
+    net: settings::NetForm,
+    /// Se o OpenDesk está registrado para abrir com o sistema.
+    autostart: bool,
+    recents: Recents,
+    history: History,
+    /// Os eventos mais recentes do histórico, para a tela de configurações.
+    history_view: Vec<Entry>,
+    screen: Screen,
+    /// Nome do computador no sistema; vale quando o das configurações está vazio.
+    system_name: String,
     device_name: String,
     local_address: String,
     /// Busca por ID; `None` quando não há servidor de encontro configurado.
     lookup: Option<Arc<Lookup>>,
     presence: Arc<Mutex<Presence>>,
+    presence_task: Option<tokio::task::JoinHandle<()>>,
 
     requests: Vec<Request>,
     inbound: Vec<Inbound>,
@@ -104,6 +147,8 @@ struct Outgoing {
     fingerprint: Option<Fingerprint>,
     route: Option<Route>,
     stage: Stage,
+    /// Quando a sessão foi autorizada, para o histórico.
+    live_since: Option<Instant>,
     texture: Option<TextureHandle>,
     epoch: u64,
     size: [usize; 2],
@@ -121,9 +166,7 @@ struct Stats {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Result<Self> {
-        theme::install(&cc.egui_ctx);
-
-        let data_dir = match std::env::var_os("OPENDESK_DATA_DIR") {
+        let data_dir: PathBuf = match std::env::var_os("OPENDESK_DATA_DIR") {
             Some(dir) => dir.into(),
             None => directories::ProjectDirs::from("org", "OpenDesk", "OpenDesk")
                 .context("não foi possível localizar a pasta de dados do usuário")?
@@ -131,10 +174,18 @@ impl App {
                 .to_path_buf(),
         };
         let identity = Arc::new(Identity::load_or_create(&data_dir)?);
+        let settings = Settings::load(&data_dir);
+        // O tema das configurações vale primeiro; `OPENDESK_THEME`, se
+        // definida, tem a última palavra (ver `theme::install`).
+        cc.egui_ctx.set_theme(match settings.theme {
+            crate::config::ThemeChoice::System => egui::ThemePreference::System,
+            crate::config::ThemeChoice::Light => egui::ThemePreference::Light,
+            crate::config::ThemeChoice::Dark => egui::ThemePreference::Dark,
+        });
+        theme::install(&cc.egui_ctx);
         let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().context("iniciar runtime")?;
 
-        let port =
-            std::env::var("OPENDESK_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(opendesk_proto::DEFAULT_PORT);
+        let port = settings.port();
         let node = {
             let _guard = runtime.enter();
             let any = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
@@ -151,30 +202,13 @@ impl App {
 
         let ctx = cc.egui_ctx.clone();
         let wake: Wake = Arc::new(move || ctx.request_repaint());
-        let device_name = std::env::var("COMPUTERNAME")
+        let system_name = std::env::var("COMPUTERNAME")
             .or_else(|_| std::env::var("HOSTNAME"))
             .unwrap_or_else(|_| "Meu computador".into());
+        let device_name = effective_name(&settings, &system_name);
         let (host, host_events) =
             Host::new(node.clone(), Arc::new(SystemBackend { display: 0 }), device_name.clone(), wake.clone());
         runtime.spawn(host.clone().serve());
-
-        // Com um servidor de encontro, este computador fica acessível pelo ID.
-        let lookup = Lookup::from_env(&data_dir).unwrap_or_else(|err| {
-            tracing::warn!("servidor de encontro mal configurado: {err:#}");
-            None
-        });
-        let presence = Arc::new(Mutex::new(Presence::Connecting));
-        if let Some(lookup) = lookup.clone() {
-            let (node, presence, wake) = (node.clone(), presence.clone(), wake.clone());
-            runtime.spawn(async move {
-                let servers = lookup.stun_servers.clone();
-                let update = move |now: Presence| {
-                    *presence.lock().unwrap() = now;
-                    wake();
-                };
-                lookup.rendezvous.serve(node, servers, lookup.relay.clone(), update).await;
-            });
-        }
 
         // As teclas saem direto da thread do gancho para a sessão, sem esperar
         // o próximo quadro da interface.
@@ -209,10 +243,21 @@ impl App {
             wake,
             ctx: cc.egui_ctx.clone(),
             logo: theme::Logo::load(),
+            net: settings::NetForm::of(&settings),
+            settings,
+            settings_problem: None,
+            autostart: opendesk_platform::system::autostart_command().is_some(),
+            recents: Recents::load(&data_dir),
+            history_view: History::new(&data_dir).latest(200),
+            history: History::new(&data_dir),
+            data_dir,
+            screen: Screen::Home,
+            system_name,
             device_name,
             local_address,
-            lookup,
-            presence,
+            lookup: None,
+            presence: Arc::new(Mutex::new(Presence::Connecting)),
+            presence_task: None,
             requests: Vec::new(),
             inbound: Vec::new(),
             address: String::new(),
@@ -227,14 +272,54 @@ impl App {
             keyboard,
             key_target,
         };
+        app.start_presence();
         #[cfg(debug_assertions)]
         app.preview();
+        // `--minimized` é como o Windows abre o app junto com o sistema.
+        if std::env::args().any(|arg| arg == "--minimized") {
+            app.ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
         // `opendesk <ID ou endereço>` conecta direto ao abrir.
-        if let Some(target) = std::env::args().nth(1) {
+        if let Some(target) = std::env::args().skip(1).find(|arg| !arg.starts_with("--")) {
             app.address = target;
             app.connect();
         }
         Ok(app)
+    }
+
+    /// (Re)inicia a presença no servidor de encontro conforme as configurações.
+    /// Com um servidor, este computador fica acessível pelo ID; sem, só por
+    /// endereço.
+    fn start_presence(&mut self) {
+        if let Some(task) = self.presence_task.take() {
+            task.abort();
+        }
+        // Um estado novo a cada vez: a tarefa antiga não escreve mais nele.
+        self.presence = Arc::new(Mutex::new(Presence::Connecting));
+        self.lookup = self.settings.rendezvous_url().and_then(|url| {
+            Lookup::new(&self.data_dir, &url, self.settings.relay())
+                .map_err(|err| tracing::warn!("servidor de encontro mal configurado: {err:#}"))
+                .ok()
+        });
+        let Some(lookup) = self.lookup.clone() else { return };
+        let (node, presence, wake) = (self.node.clone(), self.presence.clone(), self.wake.clone());
+        self.presence_task = Some(self.runtime.spawn(async move {
+            let servers = lookup.stun_servers.clone();
+            let update = move |now: Presence| {
+                *presence.lock().unwrap() = now;
+                wake();
+            };
+            lookup.rendezvous.serve(node, servers, lookup.relay.clone(), update).await;
+        }));
+    }
+
+    /// Acrescenta um evento ao histórico de sessões.
+    fn log(&mut self, incoming: bool, kind: Kind, name: &str, id: String, control: bool, seconds: u64) {
+        let when = opendesk_platform::system::local_time();
+        let entry = Entry { when, incoming, kind, name: name.to_string(), id, control, seconds };
+        self.history.append(&entry);
+        self.history_view.insert(0, entry);
+        self.history_view.truncate(200);
     }
 
     fn identity(&self) -> &Identity {
@@ -272,6 +357,40 @@ impl App {
                         Some("O computador 602 758 973 não está online. Confira o ID e tente de novo.".into());
                 }
                 "detalhes" => self.preview_details.set(true),
+                "recentes" => {
+                    let recent = |target: &str, name: &str, last: &str| crate::config::Recent {
+                        target: target.into(),
+                        name: name.into(),
+                        last: last.into(),
+                    };
+                    self.recents = Recents::in_memory(vec![
+                        recent("602 758 973", "NOTEBOOK-ANA", "2026-11-12 21:07"),
+                        recent("170 292 961", "RECEPCAO-01", "2026-11-11 09:32"),
+                        recent("192.168.0.42", "SERVIDOR-ARQUIVOS", "2026-11-08 17:15"),
+                    ]);
+                }
+                "historico" => {
+                    let entry = |incoming, kind, name: &str, control, seconds| Entry {
+                        when: "2026-11-12 21:07".into(),
+                        incoming,
+                        kind,
+                        name: name.into(),
+                        id: "602 758 973".into(),
+                        control,
+                        seconds,
+                    };
+                    self.history_view = vec![
+                        entry(false, Kind::Session, "NOTEBOOK-ANA", true, 1_260),
+                        entry(true, Kind::Session, "SUPORTE-TI", false, 340),
+                        entry(true, Kind::Refused, "DESCONHECIDO", false, 0),
+                        entry(true, Kind::Blocked, "DESCONHECIDO", false, 0),
+                    ];
+                }
+                "config" => self.screen = Screen::Settings(Tab::General),
+                "config-seguranca" => self.screen = Screen::Settings(Tab::Security),
+                "config-rede" => self.screen = Screen::Settings(Tab::Network),
+                "config-historico" => self.screen = Screen::Settings(Tab::History),
+                "config-sobre" => self.screen = Screen::Settings(Tab::About),
                 _ => {}
             }
         }
@@ -321,6 +440,7 @@ impl App {
             fingerprint: None,
             route: None,
             stage: Stage::Connecting,
+            live_since: None,
             texture: None,
             epoch: 0,
             size: [0, 0],
@@ -334,7 +454,12 @@ impl App {
         if let Some(grab) = &self.keyboard {
             grab.set_active(false);
         }
-        self.outgoing = None;
+        if let Some(out) = self.outgoing.take()
+            && let (Stage::Live { permissions }, Some(since)) = (&out.stage, out.live_since)
+        {
+            let id = out.fingerprint.map_or_else(|| out.target.clone(), |f| f.device_id().to_string());
+            self.log(false, Kind::Session, &out.host_name, id, permissions.control, since.elapsed().as_secs());
+        }
         self.notice = notice;
         // Fim da sessão: a janela volta ao tamanho compacto da tela inicial.
         if std::mem::take(&mut self.maximized_for_session) {
@@ -346,6 +471,13 @@ impl App {
         while let Ok(event) = self.host_events.try_recv() {
             match event {
                 HostEvent::Request { session, peer, reply } => {
+                    if !self.settings.accept_incoming {
+                        // Entrada desligada: recusa sem incomodar e deixa registrado.
+                        let id = peer.fingerprint.device_id().to_string();
+                        self.log(true, Kind::Blocked, &peer.name, id, false, 0);
+                        let _ = reply.send(None);
+                        continue;
+                    }
                     self.requests.push(Request { session, peer, reply, since: Instant::now() });
                     // Um pedido de acesso não pode passar despercebido.
                     if !self.quiet {
@@ -358,7 +490,15 @@ impl App {
                 }
                 HostEvent::Ended { session, .. } => {
                     self.requests.retain(|r| r.session != session);
-                    self.inbound.retain(|s| s.session != session);
+                    if let Some(index) = self.inbound.iter().position(|s| s.session == session) {
+                        let ended = self.inbound.remove(index);
+                        let id = ended.peer.fingerprint.device_id().to_string();
+                        let seconds = ended.since.elapsed().as_secs();
+                        self.log(true, Kind::Session, &ended.peer.name, id, ended.permissions.control, seconds);
+                        if self.inbound.is_empty() && self.settings.lock_on_end && !self.quiet {
+                            opendesk_platform::system::lock_workstation();
+                        }
+                    }
                 }
             }
         }
@@ -376,6 +516,8 @@ impl App {
                     }
                     ViewerEvent::Granted { permissions, .. } => {
                         out.stage = Stage::Live { permissions };
+                        out.live_since = Some(Instant::now());
+                        self.recents.touch(&out.target, &out.host_name, opendesk_platform::system::local_time());
                         granted = true;
                         if permissions.control {
                             *self.key_target.lock().unwrap() = Some(out.viewer.input_sender());
@@ -447,9 +589,12 @@ impl App {
             .show_separator_line(false)
             .frame(egui::Frame::new().fill(p.side).inner_margin(margin(28)))
             .show(ui, |ui| self.this_computer(ui, p));
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(p.bg).inner_margin(margin(40)))
-            .show(ui, |ui| self.connect_form(ui, p));
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(margin(40))).show(ui, |ui| {
+            match self.screen {
+                Screen::Home => self.connect_form(ui, p),
+                Screen::Settings(tab) => self.settings_screen(ui, p, tab),
+            }
+        });
     }
 
     fn this_computer(&mut self, ui: &mut egui::Ui, p: &Palette) {
@@ -490,7 +635,12 @@ impl App {
             self.copied_at = Some(Instant::now());
         }
         ui.add_space(4.0);
-        ui.label(theme::muted(format!("Passe {what} para quem vai acessar. Você aprova cada conexão."), p).small());
+        let hint = if self.settings.accept_incoming {
+            format!("Passe {what} para quem vai acessar. Você aprova cada conexão.")
+        } else {
+            "Este computador não está aceitando pedidos de acesso. Isso muda em Configurações, Segurança.".to_string()
+        };
+        ui.label(theme::muted(hint, p).small());
 
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
             self.status_row(ui, p, by_id, &presence, online.map(|(_, nat)| nat));
@@ -502,6 +652,9 @@ impl App {
     fn status_row(&self, ui: &mut egui::Ui, p: &Palette, by_id: bool, presence: &Presence, nat: Option<Nat>) {
         ui.horizontal(|ui| {
             let (color, status, hint) = match (by_id, presence) {
+                _ if !self.settings.accept_incoming => {
+                    (p.muted, "Entrada desligada", Some("Todo pedido de acesso é recusado automaticamente."))
+                }
                 (false, _) => (
                     p.muted,
                     "Só por endereço",
@@ -553,8 +706,15 @@ impl App {
     }
 
     fn connect_form(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        // Mesma descida da coluna ao lado: marca, espaçamento entre itens e respiro.
-        ui.add_space(LOGO_HEIGHT + ui.spacing().item_spacing.y + LOGO_GAP);
+        // Uma linha da altura da marca, com o acesso às configurações; assim
+        // os rótulos das duas colunas começam na mesma altura.
+        let header = Vec2::new(ui.available_width().min(CONTENT_WIDTH), LOGO_HEIGHT);
+        ui.allocate_ui_with_layout(header, Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("Configurações").clicked() {
+                self.screen = Screen::Settings(Tab::General);
+            }
+        });
+        ui.add_space(LOGO_GAP);
         ui.spacing_mut().item_spacing.y = 6.0;
 
         let busy = self.outgoing.is_some();
@@ -564,7 +724,7 @@ impl App {
         let (mut connect, mut cancel) = (false, false);
         ui.horizontal(|ui| {
             ui.spacing_mut().interact_size.y = 36.0;
-            let width = ui.available_width().min(FORM_WIDTH) - ACTION_WIDTH - ui.spacing().item_spacing.x;
+            let width = ui.available_width().min(CONTENT_WIDTH) - ACTION_WIDTH - ui.spacing().item_spacing.x;
             let field = ui
                 .add_enabled(
                     !busy,
@@ -616,13 +776,15 @@ impl App {
                 .corner_radius(CornerRadius::same(6))
                 .inner_margin(Margin::symmetric(10, 8))
                 .show(ui, |ui| {
-                    ui.set_width(ui.available_width().min(FORM_WIDTH) - 20.0);
+                    ui.set_width(ui.available_width().min(CONTENT_WIDTH) - 20.0);
                     ui.label(RichText::new(notice).color(p.text));
                 });
         }
+        let reopen = if busy { None } else { self.recent_list(ui, p) };
 
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-            ui.horizontal(|ui| {
+            let footer = Vec2::new(ui.available_width().min(CONTENT_WIDTH), 18.0);
+            ui.allocate_ui_with_layout(footer, Layout::left_to_right(Align::Center), |ui| {
                 let promise = if by_id {
                     "Conexão direta, cifrada de ponta a ponta."
                 } else {
@@ -637,9 +799,49 @@ impl App {
 
         if cancel {
             self.end_outgoing(None);
+        } else if let Some(target) = reopen {
+            self.address = target;
+            self.connect();
         } else if connect {
             self.connect();
         }
+    }
+
+    /// Os computadores acessados por último. Devolve o alvo escolhido, se a
+    /// pessoa clicou em algum.
+    fn recent_list(&mut self, ui: &mut egui::Ui, p: &Palette) -> Option<String> {
+        if self.recents.items.is_empty() {
+            return None;
+        }
+        ui.add_space(22.0);
+        theme::section(ui, p, "Recentes");
+        let width = ui.available_width().min(CONTENT_WIDTH);
+        let (mut open, mut remove) = (None, None);
+        // O rodapé da coluna precisa de espaço: a lista rola se não couber.
+        egui::ScrollArea::vertical().max_height((ui.available_height() - 34.0).max(40.0)).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            for (index, item) in self.recents.items.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let when = crate::config::short_when(&item.last);
+                    let link = Vec2::new(64.0, 34.0);
+                    let row = width - link.x - ui.spacing().item_spacing.x;
+                    if theme::list_row(ui, p, row, &item.name, &item.target, &when).clicked() {
+                        open = Some(item.target.clone());
+                    }
+                    // Alinhado à borda direita do formulário.
+                    ui.allocate_ui_with_layout(link, Layout::right_to_left(Align::Center), |ui| {
+                        ui.visuals_mut().hyperlink_color = p.muted;
+                        if ui.link(RichText::new("Remover").small()).clicked() {
+                            remove = Some(index);
+                        }
+                    });
+                });
+            }
+        });
+        if let Some(index) = remove {
+            self.recents.remove(index);
+        }
+        open
     }
 }
 
@@ -685,6 +887,8 @@ impl App {
         let peer = &request.peer;
         let remaining = REQUEST_TTL.saturating_sub(request.since.elapsed()).as_secs();
         let mut answer: Option<Option<Permissions>> = None;
+        // Com o controle desligado nas configurações, só dá para deixar ver.
+        let may_control = peer.wants.control && self.settings.allow_control;
 
         let frame = egui::Frame::new()
             .fill(p.surface)
@@ -716,6 +920,12 @@ impl App {
                 p,
                 "Só aceite se você conhece quem está pedindo e estava esperando por isso. Bancos, lojas e suporte técnico de verdade não pedem acesso ao seu computador por telefone.",
             );
+            if peer.wants.control && !may_control {
+                ui.label(
+                    theme::muted("O controle de mouse e teclado está desligado nas configurações deste computador.", p)
+                        .small(),
+                );
+            }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button("Recusar").clicked() {
@@ -723,7 +933,7 @@ impl App {
                 }
                 ui.label(theme::muted(format!("expira em {remaining} s"), p).small());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if peer.wants.control {
+                    if may_control {
                         if theme::primary_button(ui, p, "Permitir controle", true, 0.0).clicked() {
                             answer = Some(Some(Permissions::FULL));
                         }
@@ -739,6 +949,10 @@ impl App {
 
         if let Some(answer) = answer {
             let request = self.requests.remove(0);
+            if answer.is_none() {
+                let id = request.peer.fingerprint.device_id().to_string();
+                self.log(true, Kind::Refused, &request.peer.name, id, false, 0);
+            }
             let _ = request.reply.send(answer);
         }
     }

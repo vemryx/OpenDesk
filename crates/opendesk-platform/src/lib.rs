@@ -6,6 +6,7 @@
 //! * [`input`] — injeção de mouse e teclado no host (Windows: `SendInput`).
 //! * [`keyboard`] — captura de teclado no visualizador, para que atalhos como
 //!   Alt+Tab e a tecla Windows cheguem ao computador remoto.
+//! * [`system`] — abrir junto com o sistema, bloquear a estação, hora local.
 
 #[cfg(windows)]
 #[path = "windows/mod.rs"]
@@ -53,6 +54,10 @@ pub mod keyboard {
         pub extended: bool,
         pub down: bool,
     }
+}
+
+pub mod system {
+    pub use crate::imp::system::{autostart_command, local_time, lock_workstation, set_autostart};
 }
 
 /// Declara o processo como ciente de DPI por monitor, para que coordenadas e

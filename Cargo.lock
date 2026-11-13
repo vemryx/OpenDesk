@@ -2511,6 +2511,8 @@ dependencies = [
  "opendesk-proto",
  "opendesk-session",
  "png",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

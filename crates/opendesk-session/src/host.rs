@@ -55,7 +55,7 @@ pub enum HostEvent {
 pub struct Host {
     node: Arc<Node>,
     backend: Arc<dyn Backend>,
-    device_name: String,
+    device_name: Mutex<String>,
     events: mpsc::UnboundedSender<HostEvent>,
     wake: Wake,
     connections: Mutex<HashMap<u64, quinn::Connection>>,
@@ -77,7 +77,7 @@ impl Host {
         let host = Self {
             node,
             backend,
-            device_name,
+            device_name: Mutex::new(device_name),
             events,
             wake,
             connections: Mutex::new(HashMap::new()),
@@ -116,6 +116,11 @@ impl Host {
     }
 
     /// Encerra uma sessão (ou cancela um pedido pendente).
+    /// Troca o nome com que este computador se apresenta nas próximas sessões.
+    pub fn set_device_name(&self, name: String) {
+        *self.device_name.lock().unwrap() = name;
+    }
+
     pub fn disconnect(&self, session: u64) {
         if let Some(conn) = self.connections.lock().unwrap().get(&session) {
             conn.close(0u32.into(), b"host");
@@ -144,11 +149,12 @@ impl Host {
             Ok(Err(err)) => return Err(err).context("ler apresentação"),
             Err(_) => bail!("o visualizador não se apresentou a tempo"),
         };
+        let device_name = self.device_name.lock().unwrap().clone();
         send_msg(
             &mut tx,
             &HostMsg::Welcome {
                 protocol: PROTOCOL_VERSION,
-                device_name: self.device_name.clone(),
+                device_name,
                 app_version: env!("CARGO_PKG_VERSION").into(),
             },
         )

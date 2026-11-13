@@ -5,8 +5,8 @@
 //! vez de branco puro, e o azul da marca reservado para a ação principal.
 
 use eframe::egui::{
-    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect, Response, RichText, Sense,
-    Stroke, StrokeKind, TextStyle, TextureHandle, TextureOptions, Theme, Vec2, epaint,
+    self, Align, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Layout, Pos2, Rect, Response,
+    RichText, Sense, Stroke, StrokeKind, TextStyle, TextureHandle, TextureOptions, Theme, Vec2, epaint,
 };
 use std::sync::Arc;
 
@@ -250,6 +250,111 @@ pub fn alert(ui: &mut egui::Ui, p: &Palette, text: &str) {
             ui.set_width(ui.available_width());
             ui.label(RichText::new(text).color(p.alert_text));
         });
+}
+
+/// Contorno de foco pelo teclado, para os componentes desenhados aqui.
+fn focus_ring(ui: &egui::Ui, p: &Palette, rect: Rect, radius: u8) {
+    ui.painter().rect_stroke(
+        rect.expand(2.0),
+        CornerRadius::same(radius),
+        Stroke::new(1.5, p.accent_text),
+        StrokeKind::Outside,
+    );
+}
+
+/// Chave liga/desliga. `label` é o nome lido por leitores de tela.
+pub fn toggle(ui: &mut egui::Ui, p: &Palette, on: &mut bool, label: &str) -> Response {
+    let (rect, mut response) = ui.allocate_exact_size(Vec2::new(36.0, 20.0), Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Switch, true, *on, label));
+    if ui.is_rect_visible(rect) {
+        let t = ui.ctx().animate_bool_responsive(response.id, *on);
+        let off = if response.hovered() { p.control_hover } else { p.control };
+        let track = lerp_color(off, if response.hovered() { p.accent_hover } else { p.accent }, t);
+        ui.painter().rect_filled(rect, CornerRadius::same(10), track);
+        if t < 1.0 {
+            let edge = Stroke::new(1.0, p.border.gamma_multiply(1.0 - t));
+            ui.painter().rect_stroke(rect, CornerRadius::same(10), edge, StrokeKind::Inside);
+        }
+        let x = egui::lerp(rect.left() + 10.0..=rect.right() - 10.0, t);
+        ui.painter().circle_filled(Pos2::new(x, rect.center().y), 6.5, lerp_color(p.muted, p.on_accent, t));
+        if response.has_focus() {
+            focus_ring(ui, p, rect, 12);
+        }
+    }
+    response
+}
+
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
+}
+
+/// Uma configuração: título e explicação à esquerda, o controle à direita.
+pub fn setting(ui: &mut egui::Ui, p: &Palette, title: &str, description: &str, control: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            control(ui);
+            ui.add_space(16.0);
+            ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label(RichText::new(title).color(p.text));
+                if !description.is_empty() {
+                    ui.label(muted(description, p).small());
+                }
+            });
+        });
+    });
+}
+
+/// Aba de uma barra de abas: a selecionada ganha um traço na cor de destaque.
+pub fn tab(ui: &mut egui::Ui, p: &Palette, text: &str, selected: bool) -> Response {
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), semibold(13.5), Color32::PLACEHOLDER);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(galley.size().x, 32.0), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, selected, text));
+    if ui.is_rect_visible(rect) {
+        let ink = if selected || response.hovered() { p.text } else { p.muted };
+        ui.painter().galley(Pos2::new(rect.left(), rect.center().y - galley.size().y / 2.0), galley, ink);
+        if selected {
+            ui.painter().hline(rect.x_range(), rect.bottom() - 1.0, Stroke::new(2.0, p.accent_text));
+        }
+        if response.has_focus() {
+            focus_ring(ui, p, rect.expand2(Vec2::new(4.0, -4.0)), 6);
+        }
+    }
+    response
+}
+
+/// Linha clicável de uma lista: título, detalhe ao lado e uma nota à direita.
+pub fn list_row(ui: &mut egui::Ui, p: &Palette, width: f32, title: &str, detail: &str, trailing: &str) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 34.0), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("{title}, {detail}")));
+    if ui.is_rect_visible(rect) {
+        if response.is_pointer_button_down_on() || response.hovered() {
+            let fill = if response.is_pointer_button_down_on() { p.control_hover } else { p.control };
+            ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
+        }
+        if response.has_focus() {
+            focus_ring(ui, p, rect, 8);
+        }
+        let painter = ui.painter().with_clip_rect(rect.shrink2(Vec2::new(10.0, 0.0)));
+        let middle = |galley: &egui::Galley| rect.center().y - galley.size().y / 2.0;
+        let note = painter.layout_no_wrap(trailing.to_owned(), FontId::proportional(12.0), p.muted);
+        let note_x = rect.right() - 10.0 - note.size().x;
+        painter.galley(Pos2::new(note_x, middle(&note)), note, p.muted);
+
+        // O título e o detalhe não invadem a nota.
+        let painter = painter.with_clip_rect(Rect::from_min_max(rect.min, Pos2::new(note_x - 12.0, rect.max.y)));
+        let name = painter.layout_no_wrap(title.to_owned(), semibold(13.5), p.text);
+        let detail_x = rect.left() + 10.0 + name.size().x + 10.0;
+        painter.galley(Pos2::new(rect.left() + 10.0, middle(&name)), name, p.text);
+        let detail = painter.layout_no_wrap(detail.to_owned(), FontId::proportional(13.5), p.muted);
+        painter.galley(Pos2::new(detail_x, middle(&detail)), detail, p.muted);
+    }
+    response
 }
 
 // ───────────────────────────────── Marca ─────────────────────────────────

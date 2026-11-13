@@ -52,7 +52,21 @@ A interface é neutra e compacta: cinzas levemente frios, branco suave em vez de
 
 A identidade oficial está em `assets/brand/`. O símbolo é desenhado em vetor pelo próprio app; o nome "OpenDesk" é uma máscara em tons de cinza embutida no executável e tingida com a cor do tema. `assets/brand/make_assets.py` regenera essa máscara e o ícone (`apps/opendesk/assets/`), que o `build.rs` embute no `.exe` no Windows.
 
-Para conferir telas sem um segundo computador, builds de desenvolvimento aceitam `OPENDESK_PREVIEW=pedido,acesso,aviso,detalhes`.
+Para conferir telas sem um segundo computador, builds de desenvolvimento aceitam `OPENDESK_PREVIEW` com uma lista de estados: `pedido`, `acesso`, `aviso`, `detalhes`, `recentes`, `historico`, `config`, `config-seguranca`, `config-rede`, `config-historico`, `config-sobre`.
+
+## Configurações e dados locais
+
+Tudo o que o app guarda fica na pasta de dados do usuário, em texto legível (`apps/opendesk/src/config.rs`):
+
+| Arquivo | Conteúdo |
+|---|---|
+| `settings.json` | Configurações. Campos ausentes valem o padrão; arquivo corrompido não impede o app de abrir. |
+| `recent.json` | Os oito computadores acessados por último. |
+| `history.jsonl` | Registro de sessões, só acrescentado: uma linha JSON por sessão feita ou recebida e por pedido recusado (pela pessoa ou pela política). |
+| `known_hosts` | Impressões digitais fixadas (ver abaixo). |
+| `identity.*.der` | A chave e o certificado do dispositivo. |
+
+As políticas de entrada são aplicadas no próprio app, antes de qualquer diálogo: com "aceitar pedidos" desligado o pedido é recusado e registrado; com "permitir controle" desligado só é possível autorizar a visualização. Servidor de encontro e relay trocam na hora (a presença é reiniciada); a porta vale ao reabrir. "Abrir com o Windows" grava a chave `Run` do usuário no registro, sem exigir administrador. Variáveis de ambiente têm prioridade sobre o arquivo, para implantações.
 
 ## Identidade e segurança
 
