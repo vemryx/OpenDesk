@@ -1,0 +1,16 @@
+[package]
+name = "opendesk-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lógica de sessão do OpenDesk: o lado que compartilha a tela (host) e o lado que vê e controla (visualizador)"
+
+[dependencies]
+opendesk-proto.workspace = true
+opendesk-codec.workspace = true
+opendesk-net.workspace = true
+opendesk-platform.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+quinn.workspace = true
+tracing.workspace = true

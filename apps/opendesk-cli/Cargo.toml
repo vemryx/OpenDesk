@@ -1,0 +1,18 @@
+[package]
+name = "opendesk-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenDesk em linha de comando: diagnóstico, testes ponta a ponta e uso sem interface"
+
+[dependencies]
+opendesk-proto.workspace = true
+opendesk-net.workspace = true
+opendesk-platform.workspace = true
+opendesk-session.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+clap.workspace = true
+directories.workspace = true
+png.workspace = true
+tracing-subscriber.workspace = true

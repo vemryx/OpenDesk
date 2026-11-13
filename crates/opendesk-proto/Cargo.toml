@@ -1,0 +1,12 @@
+[package]
+name = "opendesk-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Protocolo de fio do OpenDesk: mensagens de controle, pacotes de vídeo e enquadramento"
+
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true }

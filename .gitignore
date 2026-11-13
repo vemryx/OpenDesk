@@ -1,0 +1,8 @@
+/target
+*.pdb
+.DS_Store
+/.vscode
+/.idea
+# Identidade e configuração locais nunca vão para o repositório
+*.key.der
+*.cert.der

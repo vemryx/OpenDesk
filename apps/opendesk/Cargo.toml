@@ -1,0 +1,18 @@
+[package]
+name = "opendesk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenDesk: acesso remoto P2P, gratuito e de código aberto"
+
+[dependencies]
+opendesk-proto.workspace = true
+opendesk-net.workspace = true
+opendesk-platform.workspace = true
+opendesk-session.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+directories.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "clipboard", "accesskit"] }

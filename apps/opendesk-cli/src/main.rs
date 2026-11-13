@@ -1,0 +1,231 @@
+//! OpenDesk em linha de comando.
+//!
+//! Serve para diagnóstico e para testar o caminho completo
+//! captura → codec → rede → decodificação sem a interface gráfica.
+
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
+use opendesk_net::{Identity, Node};
+use opendesk_proto::control::Permissions;
+use opendesk_session::backend::SystemBackend;
+use opendesk_session::host::{Host, HostEvent};
+use opendesk_session::viewer::{Viewer, ViewerEvent};
+use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+#[derive(Parser)]
+#[command(name = "opendesk-cli", version, about = "OpenDesk: acesso remoto P2P de código aberto")]
+struct Cli {
+    /// Pasta de dados (identidade do dispositivo). Padrão: pasta do usuário.
+    #[arg(long, global = true, env = "OPENDESK_DATA_DIR")]
+    data_dir: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Mostra o ID e a impressão digital deste dispositivo.
+    Id,
+    /// Lista os monitores que podem ser compartilhados.
+    Displays,
+    /// Compartilha a tela deste computador.
+    Host {
+        #[arg(long, default_value_t = opendesk_proto::DEFAULT_PORT)]
+        port: u16,
+        /// Monitor a compartilhar (índice de `displays`).
+        #[arg(long, default_value_t = 0)]
+        display: usize,
+        /// SÓ PARA TESTES: aceita pedidos sem perguntar. Restringe a escuta a
+        /// 127.0.0.1, então nada fora deste computador consegue conectar.
+        #[arg(long, value_enum)]
+        auto_accept_loopback: Option<AutoAccept>,
+    },
+    /// Conecta a um host e mede a recepção; opcionalmente salva a tela em PNG.
+    View {
+        /// Endereço do host, por exemplo 192.168.0.10:47700.
+        addr: SocketAddr,
+        /// Por quantos segundos receber.
+        #[arg(long, default_value_t = 3.0)]
+        seconds: f32,
+        /// Salva o último estado da tela remota neste arquivo PNG.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Pede também controle de mouse e teclado.
+        #[arg(long)]
+        control: bool,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum AutoAccept {
+    /// Só visualização.
+    View,
+    /// Visualização e controle.
+    Control,
+}
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+    opendesk_platform::init_process();
+    let cli = Cli::parse();
+    let data_dir = match cli.data_dir {
+        Some(dir) => dir,
+        None => directories::ProjectDirs::from("org", "OpenDesk", "OpenDesk")
+            .context("não foi possível localizar a pasta de dados do usuário")?
+            .data_dir()
+            .to_path_buf(),
+    };
+
+    match cli.command {
+        Command::Id => {
+            let identity = Identity::load_or_create(&data_dir)?;
+            println!("ID:                {}", identity.device_id());
+            println!("Impressão digital: {}", identity.fingerprint().hex());
+            println!("Dados em:          {}", data_dir.display());
+            Ok(())
+        }
+        Command::Displays => {
+            for (i, d) in opendesk_platform::capture::displays()?.iter().enumerate() {
+                let primary = if d.primary { " (principal)" } else { "" };
+                println!("{i}: {} {}x{} em ({}, {}){primary}", d.name, d.width, d.height, d.x, d.y);
+            }
+            Ok(())
+        }
+        Command::Host { port, display, auto_accept_loopback } => {
+            let identity = Arc::new(Identity::load_or_create(&data_dir)?);
+            runtime()?.block_on(host(identity, port, display, auto_accept_loopback))
+        }
+        Command::View { addr, seconds, out, control } => {
+            let identity = Arc::new(Identity::load_or_create(&data_dir)?);
+            runtime()?.block_on(view(identity, addr, seconds, out, control))
+        }
+    }
+}
+
+fn runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread().enable_all().build().context("iniciar runtime")
+}
+
+fn device_name() -> String {
+    std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "dispositivo".into())
+}
+
+async fn host(identity: Arc<Identity>, port: u16, display: usize, auto: Option<AutoAccept>) -> Result<()> {
+    let ip = if auto.is_some() { IpAddr::V4(Ipv4Addr::LOCALHOST) } else { IpAddr::V4(Ipv4Addr::UNSPECIFIED) };
+    let node = Arc::new(Node::bind(identity.clone(), SocketAddr::new(ip, port))?);
+    println!("OpenDesk {} — ID {}", env!("CARGO_PKG_VERSION"), identity.device_id());
+    println!("Escutando em {}", node.local_addr()?);
+    if auto.is_some() {
+        println!("MODO DE TESTE: aceitando automaticamente, somente a partir deste computador.");
+    }
+
+    let (host, mut events) = Host::new(node, Arc::new(SystemBackend { display }), device_name(), Arc::new(|| {}));
+    tokio::spawn(host.clone().serve());
+
+    while let Some(event) = events.recv().await {
+        match event {
+            HostEvent::Request { peer, reply, .. } => {
+                println!(
+                    "\nPedido de conexão de \"{}\" — ID {} ({}) em {}",
+                    peer.name,
+                    peer.fingerprint.device_id(),
+                    peer.fingerprint.short(),
+                    peer.addr
+                );
+                let answer = match auto {
+                    Some(AutoAccept::View) => Some(Permissions::VIEW_ONLY),
+                    Some(AutoAccept::Control) => Some(Permissions::FULL),
+                    None => tokio::task::spawn_blocking(move || ask(peer.wants)).await??,
+                };
+                let _ = reply.send(answer);
+            }
+            HostEvent::Started { peer, permissions, .. } => {
+                let mode = if permissions.control { "com controle" } else { "somente visualização" };
+                println!("Sessão iniciada com \"{}\" ({mode}). Ctrl+C encerra.", peer.name);
+            }
+            HostEvent::Ended { reason, .. } => println!("Sessão encerrada: {reason}"),
+        }
+    }
+    Ok(())
+}
+
+fn ask(wants: Permissions) -> Result<Option<Permissions>> {
+    let options =
+        if wants.control { "[v] só ver  [c] ver e controlar  [n] recusar" } else { "[v] permitir ver  [n] recusar" };
+    print!("{options} > ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(match line.trim().to_lowercase().as_str() {
+        "v" => Some(Permissions::VIEW_ONLY),
+        "c" if wants.control => Some(Permissions::FULL),
+        _ => None,
+    })
+}
+
+async fn view(
+    identity: Arc<Identity>,
+    addr: SocketAddr,
+    seconds: f32,
+    out: Option<PathBuf>,
+    control: bool,
+) -> Result<()> {
+    let node = Arc::new(Node::bind(identity, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?);
+    let wants = if control { Permissions::FULL } else { Permissions::VIEW_ONLY };
+    let (viewer, mut events) =
+        Viewer::connect(&tokio::runtime::Handle::current(), node, addr, device_name(), wants, Arc::new(|| {}));
+
+    loop {
+        match events.recv().await.context("a sessão terminou sem aviso")? {
+            ViewerEvent::Connected { host_name, fingerprint } => {
+                println!("Conectado a \"{host_name}\" — ID {} ({})", fingerprint.device_id(), fingerprint.short());
+                println!("Aguardando autorização no computador remoto…");
+            }
+            ViewerEvent::Granted { permissions, display } => {
+                let mode = if permissions.control { "com controle" } else { "somente visualização" };
+                println!("Autorizado ({mode}). Tela remota: {} {}x{}", display.name, display.width, display.height);
+                break;
+            }
+            ViewerEvent::Denied(_) => {}
+            ViewerEvent::Closed(reason) => bail!("{reason}"),
+        }
+    }
+
+    let started = Instant::now();
+    let first_frame = loop {
+        if viewer.frame.lock().unwrap().frames > 0 {
+            break started.elapsed();
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            bail!("nenhum quadro recebido em 10 s");
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    };
+    tokio::time::sleep(Duration::from_secs_f32(seconds.max(0.0))).await;
+
+    let frame = viewer.frame.lock().unwrap();
+    let elapsed = started.elapsed().as_secs_f64();
+    println!("Primeiro quadro em {:.0} ms", first_frame.as_secs_f64() * 1000.0);
+    println!(
+        "{} quadros em {:.1} s ({:.1} qps), {:.2} MB recebidos ({:.2} Mbit/s)",
+        frame.frames,
+        elapsed,
+        frame.frames as f64 / elapsed,
+        frame.bytes as f64 / 1e6,
+        frame.bytes as f64 * 8.0 / 1e6 / elapsed
+    );
+    if let Some(path) = out {
+        let file = std::fs::File::create(&path).with_context(|| format!("criar {}", path.display()))?;
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), frame.width as u32, frame.height as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Fast);
+        encoder.write_header()?.write_image_data(&frame.rgba)?;
+        println!("Tela remota salva em {}", path.display());
+    }
+    Ok(())
+}
