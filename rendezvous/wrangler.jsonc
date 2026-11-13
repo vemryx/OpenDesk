@@ -1,0 +1,12 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "opendesk-rendezvous",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  // Um Durable Object por ID de dispositivo. Classes com SQLite funcionam no
+  // plano gratuito da Cloudflare.
+  "durable_objects": {
+    "bindings": [{ "name": "DEVICE", "class_name": "Device" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Device"] }]
+}

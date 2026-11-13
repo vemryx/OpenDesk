@@ -8,7 +8,7 @@ use opendesk_proto::control::{DenyReason, InputEvent, MouseButton, Permissions};
 use opendesk_session::Wake;
 use opendesk_session::backend::{Backend, FrameSource, InputSink};
 use opendesk_session::host::{Host, HostEvent};
-use opendesk_session::viewer::{Viewer, ViewerEvent};
+use opendesk_session::viewer::{Route, Target, Viewer, ViewerEvent};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -122,7 +122,8 @@ fn start_host(answer: Option<Permissions>) -> (Arc<Shared>, Arc<Host>, SocketAdd
 }
 
 fn start_viewer(addr: SocketAddr, wants: Permissions) -> (Viewer, UnboundedReceiver<ViewerEvent>) {
-    Viewer::connect(&tokio::runtime::Handle::current(), node(), addr, "visualizador-de-teste".into(), wants, no_wake())
+    let (target, name) = (Target::Address(addr), "visualizador-de-teste".into());
+    Viewer::connect(&tokio::runtime::Handle::current(), node(), target, name, wants, no_wake())
 }
 
 async fn next(events: &mut UnboundedReceiver<ViewerEvent>) -> ViewerEvent {
@@ -144,9 +145,11 @@ async fn granted_session_streams_screen_and_delivers_input() {
     let (shared, host, addr, mut ended) = start_host(Some(Permissions::FULL));
     let (viewer, mut events) = start_viewer(addr, Permissions::FULL);
 
-    assert!(
-        matches!(next(&mut events).await, ViewerEvent::Connected { host_name, .. } if host_name == "host-de-teste")
-    );
+    assert!(matches!(
+        next(&mut events).await,
+        ViewerEvent::Connected { host_name, route: Route::Address, .. } if host_name == "host-de-teste"
+    ));
+    assert!(viewer.rtt().is_some_and(|rtt| rtt < Duration::from_secs(1)));
     match next(&mut events).await {
         ViewerEvent::Granted { permissions, display } => {
             assert!(permissions.control);

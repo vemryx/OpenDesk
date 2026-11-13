@@ -11,15 +11,15 @@ use eframe::egui::{
     self, Align, Color32, ColorImage, CornerRadius, Event, Layout, Margin, MouseWheelUnit, PointerButton, Pos2, Rect,
     RichText, Sense, Stroke, TextureHandle, TextureOptions, Vec2,
 };
-use opendesk_net::{Fingerprint, Identity, Node};
+use opendesk_net::{DeviceId, Fingerprint, Identity, Nat, Node, Presence};
 use opendesk_platform::keyboard::KeyboardGrab;
 use opendesk_proto::control::{InputEvent, MouseButton, Permissions};
 use opendesk_session::Wake;
 use opendesk_session::backend::SystemBackend;
 use opendesk_session::host::{Host, HostEvent, PeerInfo};
-use opendesk_session::viewer::{InputSender, Viewer, ViewerEvent};
+use opendesk_session::viewer::{InputSender, Lookup, Route, Target, Viewer, ViewerEvent};
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -35,6 +35,9 @@ pub struct App {
     wake: Wake,
     device_name: String,
     local_address: String,
+    /// Busca por ID; `None` quando não há servidor de encontro configurado.
+    lookup: Option<Arc<Lookup>>,
+    presence: Arc<Mutex<Presence>>,
 
     requests: Vec<Request>,
     inbound: Vec<Inbound>,
@@ -73,8 +76,10 @@ struct Outgoing {
     viewer: Viewer,
     events: mpsc::UnboundedReceiver<ViewerEvent>,
     target: String,
+    by_id: bool,
     host_name: String,
     fingerprint: Option<Fingerprint>,
+    route: Option<Route>,
     stage: Stage,
     texture: Option<TextureHandle>,
     epoch: u64,
@@ -116,7 +121,7 @@ impl App {
         };
         let node = Arc::new(node);
         let bound_port = node.local_addr()?.port();
-        let local_address = match local_ip() {
+        let local_address = match opendesk_net::local_ip() {
             Some(ip) => format!("{ip}:{bound_port}"),
             None => format!("porta {bound_port} (sem rede)"),
         };
@@ -129,6 +134,24 @@ impl App {
         let (host, host_events) =
             Host::new(node.clone(), Arc::new(SystemBackend { display: 0 }), device_name.clone(), wake.clone());
         runtime.spawn(host.clone().serve());
+
+        // Com um servidor de encontro, este computador fica acessível pelo ID.
+        let lookup = Lookup::from_env(&data_dir).unwrap_or_else(|err| {
+            tracing::warn!("servidor de encontro mal configurado: {err:#}");
+            None
+        });
+        let presence = Arc::new(Mutex::new(Presence::Connecting));
+        if let Some(lookup) = lookup.clone() {
+            let (node, presence, wake) = (node.clone(), presence.clone(), wake.clone());
+            runtime.spawn(async move {
+                let servers = lookup.stun_servers.clone();
+                let update = move |now: Presence| {
+                    *presence.lock().unwrap() = now;
+                    wake();
+                };
+                lookup.rendezvous.serve(node, servers, update).await;
+            });
+        }
 
         // As teclas saem direto da thread do gancho para a sessão, sem esperar
         // o próximo quadro da interface.
@@ -163,6 +186,8 @@ impl App {
             wake,
             device_name,
             local_address,
+            lookup,
+            presence,
             requests: Vec::new(),
             inbound: Vec::new(),
             address: String::new(),
@@ -173,7 +198,7 @@ impl App {
             keyboard,
             key_target,
         };
-        // `opendesk <endereço>` conecta direto ao abrir.
+        // `opendesk <ID ou endereço>` conecta direto ao abrir.
         if let Some(target) = std::env::args().nth(1) {
             app.address = target;
             app.connect();
@@ -185,36 +210,56 @@ impl App {
         self.node.identity()
     }
 
-    fn connect(&mut self) {
-        let target = self.address.trim().to_string();
-        match resolve(&target) {
-            Ok(addr) => {
-                let wants = if self.want_control { Permissions::FULL } else { Permissions::VIEW_ONLY };
-                let (viewer, events) = Viewer::connect(
-                    self.runtime.handle(),
-                    self.node.clone(),
-                    addr,
-                    self.device_name.clone(),
-                    wants,
-                    self.wake.clone(),
-                );
-                self.notice = None;
-                self.outgoing = Some(Outgoing {
-                    viewer,
-                    events,
-                    target,
-                    host_name: String::new(),
-                    fingerprint: None,
-                    stage: Stage::Connecting,
-                    texture: None,
-                    epoch: 0,
-                    size: [0, 0],
-                    buttons: HashSet::new(),
-                    stats: Stats { at: Instant::now(), frames: 0, bytes: 0, fps: 0.0, mbps: 0.0 },
-                });
-            }
-            Err(message) => self.notice = Some(message),
+    /// Interpreta o que foi digitado: um ID de 9 dígitos ou um endereço.
+    fn parse_target(&self, text: &str) -> Result<(Target, String), String> {
+        if text.is_empty() {
+            return Err("Informe o ID ou o endereço do computador remoto.".into());
         }
+        if let Some(id) = DeviceId::parse(text) {
+            return match &self.lookup {
+                Some(lookup) => Ok((Target::Id { id, lookup: lookup.clone() }, id.to_string())),
+                None => Err("Conectar por ID precisa de um servidor de encontro, e nenhum está configurado. \
+                             Use o endereço do computador."
+                    .into()),
+            };
+        }
+        resolve(text).map(|addr| (Target::Address(addr), text.to_string()))
+    }
+
+    fn connect(&mut self) {
+        let (target, label) = match self.parse_target(self.address.trim()) {
+            Ok(parsed) => parsed,
+            Err(message) => {
+                self.notice = Some(message);
+                return;
+            }
+        };
+        let by_id = matches!(target, Target::Id { .. });
+        let wants = if self.want_control { Permissions::FULL } else { Permissions::VIEW_ONLY };
+        let (viewer, events) = Viewer::connect(
+            self.runtime.handle(),
+            self.node.clone(),
+            target,
+            self.device_name.clone(),
+            wants,
+            self.wake.clone(),
+        );
+        self.notice = None;
+        self.outgoing = Some(Outgoing {
+            viewer,
+            events,
+            target: label,
+            by_id,
+            host_name: String::new(),
+            fingerprint: None,
+            route: None,
+            stage: Stage::Connecting,
+            texture: None,
+            epoch: 0,
+            size: [0, 0],
+            buttons: HashSet::new(),
+            stats: Stats { at: Instant::now(), frames: 0, bytes: 0, fps: 0.0, mbps: 0.0 },
+        });
     }
 
     fn end_outgoing(&mut self, notice: Option<String>) {
@@ -249,9 +294,10 @@ impl App {
         if let Some(out) = &mut self.outgoing {
             while let Ok(event) = out.events.try_recv() {
                 match event {
-                    ViewerEvent::Connected { host_name, fingerprint } => {
+                    ViewerEvent::Connected { host_name, fingerprint, route } => {
                         out.host_name = host_name;
                         out.fingerprint = Some(fingerprint);
+                        out.route = Some(route);
                         out.stage = Stage::Waiting;
                     }
                     ViewerEvent::Granted { permissions, .. } => {
@@ -321,9 +367,15 @@ impl App {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("OpenDesk").font(theme::semibold(20.0)).color(p.text));
+                    let (color, status) = match (&self.lookup, &*self.presence.lock().unwrap()) {
+                        (None, _) => (p.accent, "Pronto para conexões por endereço"),
+                        (Some(_), Presence::Online { .. }) => (p.accent, "Online · pronto para receber conexões"),
+                        (Some(_), Presence::Connecting) => (p.muted, "Entrando no servidor de encontro…"),
+                        (Some(_), Presence::Offline(_)) => (p.danger, "Sem servidor de encontro · só por endereço"),
+                    };
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(theme::muted("Pronto para receber conexões", p));
-                        theme::dot(ui, p.accent);
+                        ui.label(theme::muted(status, p));
+                        theme::dot(ui, color);
                     });
                 });
             });
@@ -373,18 +425,45 @@ impl App {
         ui.spacing_mut().item_spacing.x = 10.0;
         theme::caption(ui, p, "ESTE COMPUTADOR");
         ui.add_space(6.0);
-        ui.label(theme::muted("Endereço para conexão", p));
-        ui.add(
-            egui::Label::new(RichText::new(&self.local_address).font(theme::semibold(28.0)).color(p.text))
-                .selectable(true),
-        );
+
+        // Com servidor de encontro, o que se compartilha é o ID; sem ele, o
+        // endereço na rede.
+        let by_id = self.lookup.is_some();
+        let presence = self.presence.lock().unwrap().clone();
+        let online = match &presence {
+            Presence::Online { id, nat } if by_id => Some((*id, *nat)),
+            _ => None,
+        };
+        let (title, value, copy) = match (by_id, online) {
+            (true, Some((id, _))) => ("Seu ID", Some(id.to_string()), "Copiar ID"),
+            (true, None) => ("Seu ID", None, "Copiar ID"),
+            (false, _) => ("Endereço para conexão", Some(self.local_address.clone()), "Copiar endereço"),
+        };
+        ui.label(theme::muted(title, p));
+        let shown = value.as_deref().unwrap_or("— — —");
+        let color = if value.is_some() { p.text } else { p.muted };
+        let size = if by_id { 34.0 } else { 28.0 };
+        ui.add(egui::Label::new(RichText::new(shown).font(theme::semibold(size)).color(color)).selectable(true));
+        match &presence {
+            Presence::Connecting if by_id => {
+                ui.label(theme::muted("Entrando no servidor de encontro…", p).small());
+            }
+            Presence::Offline(reason) if by_id => {
+                ui.label(theme::muted("Sem contato com o servidor de encontro. Tentando de novo…", p).small())
+                    .on_hover_text(reason);
+            }
+            _ => {}
+        }
         ui.add_space(2.0);
         let just_copied = self.copied_at.is_some_and(|at| at.elapsed() < Duration::from_secs(2));
         if !just_copied {
             self.copied_at = None;
         }
-        if ui.button(if just_copied { "Copiado" } else { "Copiar endereço" }).clicked() {
-            ui.ctx().copy_text(self.local_address.clone());
+        let button = egui::Button::new(if just_copied { "Copiado" } else { copy });
+        if ui.add_enabled(value.is_some(), button).clicked()
+            && let Some(value) = value
+        {
+            ui.ctx().copy_text(value);
             self.copied_at = Some(Instant::now());
         }
 
@@ -394,18 +473,34 @@ impl App {
         let fingerprint = self.identity().fingerprint();
         egui::Grid::new("identity").num_columns(2).spacing([18.0, 6.0]).min_row_height(22.0).show(ui, |ui| {
             theme::detail(ui, p, "Nome", &self.device_name);
-            theme::detail(ui, p, "ID do dispositivo", &fingerprint.device_id().to_string());
+            if by_id {
+                theme::detail(ui, p, "Endereço na rede", &self.local_address);
+            } else {
+                theme::detail(ui, p, "ID do dispositivo", &fingerprint.device_id().to_string());
+            }
             theme::detail(ui, p, "Impressão digital", &fingerprint.short());
         });
 
         ui.add_space(8.0);
+        let what = if by_id { "o ID" } else { "o endereço" };
         ui.label(
             theme::muted(
-                "Passe o endereço para quem vai acessar este computador. Nenhuma conexão começa sem você aprovar aqui.",
+                format!(
+                    "Passe {what} para quem vai acessar este computador. Nenhuma conexão começa sem você aprovar aqui."
+                ),
                 p,
             )
             .small(),
         );
+        if matches!(online, Some((_, Nat::Symmetric))) {
+            ui.label(
+                RichText::new(
+                    "Sua rede usa NAT simétrico: conexões vindas da internet podem falhar enquanto o relay não existir.",
+                )
+                .small()
+                .color(p.alert_text),
+            );
+        }
     }
 
     fn connect_form(&mut self, ui: &mut egui::Ui, p: &Palette) {
@@ -414,11 +509,15 @@ impl App {
         ui.add_space(6.0);
 
         let busy = self.outgoing.is_some();
-        let label = ui.label(theme::muted("Endereço do computador remoto", p));
+        let by_id = self.lookup.is_some();
+        let label = ui.label(theme::muted(
+            if by_id { "ID ou endereço do computador remoto" } else { "Endereço do computador remoto" },
+            p,
+        ));
         let field = ui.add_enabled(
             !busy,
             egui::TextEdit::singleline(&mut self.address)
-                .hint_text("192.168.0.10")
+                .hint_text(if by_id { "602 758 973" } else { "192.168.0.10" })
                 .font(egui::FontId::proportional(17.0))
                 .margin(Margin::symmetric(12, 10))
                 .desired_width(f32::INFINITY),
@@ -431,6 +530,7 @@ impl App {
 
         if busy {
             let (status, cancel) = match self.outgoing.as_ref().map(|o| (&o.stage, o)) {
+                Some((Stage::Connecting, out)) if out.by_id => (format!("Procurando {}…", out.target), "Cancelar"),
                 Some((Stage::Connecting, out)) => (format!("Conectando a {}…", out.target), "Cancelar"),
                 Some((_, out)) => (format!("Aguardando {} autorizar o acesso…", out.host_name), "Cancelar pedido"),
                 None => (String::new(), "Cancelar"),
@@ -478,7 +578,11 @@ impl App {
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
             ui.label(
                 theme::muted(
-                    "Por enquanto a conexão é direta, por endereço: os dois computadores precisam estar na mesma rede (ou com a porta encaminhada). Conexão por ID chega com o servidor de encontro.",
+                    if by_id {
+                        "Com o ID, o OpenDesk localiza o outro computador e conecta direto a ele, ponto a ponto. O endereço (ex.: 192.168.0.10) também funciona, na mesma rede."
+                    } else {
+                        "Nenhum servidor de encontro configurado: a conexão é direta, por endereço. Os dois computadores precisam estar na mesma rede (ou com a porta encaminhada)."
+                    },
                     p,
                 )
                 .small(),
@@ -611,9 +715,18 @@ impl App {
                 ui.horizontal(|ui| {
                     theme::dot(ui, p.accent);
                     ui.label(RichText::new(&out.host_name).font(theme::semibold(14.5)).color(p.text));
-                    if let Some(fingerprint) = out.fingerprint {
-                        ui.label(theme::muted(format!("ID {}", fingerprint.device_id()), p).small());
+                    // Transparência: por onde a sessão passa e com que atraso.
+                    if let Some(route) = out.route {
+                        let latency = match out.viewer.rtt() {
+                            Some(rtt) if rtt < Duration::from_millis(1) => " · <1 ms".to_string(),
+                            Some(rtt) => format!(" · {} ms", rtt.as_millis()),
+                            None => String::new(),
+                        };
+                        ui.label(theme::muted(format!("{}{latency}", route.label()), p).small()).on_hover_text(
+                            "A sessão vai direto de um computador ao outro, cifrada de ponta a ponta. Nenhum servidor vê a tela.",
+                        );
                     }
+                    let roomy = ui.available_width() > 620.0;
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.button("Encerrar").clicked() {
                             end = true;
@@ -622,10 +735,14 @@ impl App {
                         ui.label(RichText::new(mode).color(p.text));
                         ui.label(
                             theme::muted(
-                                format!(
-                                    "{}×{} · {:.0} qps · {:.1} Mbit/s",
-                                    out.size[0], out.size[1], out.stats.fps, out.stats.mbps
-                                ),
+                                if roomy {
+                                    format!(
+                                        "Tiles v1 · {}×{} · {:.0} qps · {:.1} Mbit/s",
+                                        out.size[0], out.size[1], out.stats.fps, out.stats.mbps
+                                    )
+                                } else {
+                                    format!("{:.0} qps · {:.1} Mbit/s", out.stats.fps, out.stats.mbps)
+                                },
                                 p,
                             )
                             .small(),
@@ -770,14 +887,6 @@ impl Stats {
 }
 
 // ───────────────────────────── Utilidades ─────────────────────────────
-
-/// IP local pelo qual este computador sai para a rede. Um socket UDP
-/// "conectado" não envia nenhum pacote; só faz o sistema escolher a rota.
-fn local_ip() -> Option<IpAddr> {
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
-    socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
-    Some(socket.local_addr().ok()?.ip())
-}
 
 /// Aceita `ip`, `ip:porta`, `nome` ou `nome:porta`.
 fn resolve(target: &str) -> Result<SocketAddr, String> {

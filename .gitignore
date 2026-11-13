@@ -6,3 +6,8 @@
 # Identidade e configuração locais nunca vão para o repositório
 *.key.der
 *.cert.der
+
+# Servidor de encontro
+node_modules/
+.wrangler/
+.dev.vars

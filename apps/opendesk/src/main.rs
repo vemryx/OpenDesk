@@ -12,14 +12,21 @@ fn main() -> eframe::Result {
     tracing_subscriber::fmt().with_writer(std::io::stderr).init();
     opendesk_platform::init_process();
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("OpenDesk")
-            .with_icon(icon())
-            .with_inner_size([960.0, 620.0])
-            .with_min_inner_size([780.0, 540.0]),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("OpenDesk")
+        .with_icon(icon())
+        .with_inner_size([960.0, 620.0])
+        .with_min_inner_size([780.0, 540.0]);
+    // Para desenvolvimento e testes: `OPENDESK_WINDOW_POS=x,y` abre a janela
+    // nessa posição e sem tomar o foco de quem está usando o computador.
+    let position = std::env::var("OPENDESK_WINDOW_POS").ok().and_then(|value| {
+        let (x, y) = value.split_once(',')?;
+        Some([x.trim().parse::<f32>().ok()?, y.trim().parse::<f32>().ok()?])
+    });
+    if let Some(position) = position {
+        viewport = viewport.with_position(position).with_active(false);
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native("OpenDesk", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)?))))
 }
 

@@ -1,14 +1,14 @@
 use crate::{Wake, describe_close};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use opendesk_codec::decode_packet;
-use opendesk_net::{Fingerprint, Node};
+use opendesk_net::{DeviceId, Fingerprint, KnownHosts, Node, PeerConn, Rendezvous};
 use opendesk_proto::PROTOCOL_VERSION;
 use opendesk_proto::control::{Decision, DenyReason, DisplayDesc, Hello, HostMsg, InputEvent, Permissions, ViewerMsg};
 use opendesk_proto::video::FramePacket;
 use opendesk_proto::wire::{MAX_VIDEO_FRAME, read_frame, recv_msg, send_msg};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc};
 
 /// Framebuffer remoto, compartilhado entre a tarefa de rede e a interface.
@@ -35,12 +35,70 @@ impl SharedFrame {
     }
 }
 
+/// Por quanto tempo o visualizador abre caminho para o host ao conectar por ID.
+const PUNCH_FOR: Duration = Duration::from_secs(8);
+/// Limite para a corrida entre os endereços candidatos do host.
+const CONNECT_LIMIT: Duration = Duration::from_secs(10);
+
+/// Para onde conectar.
+#[derive(Clone)]
+pub enum Target {
+    /// Um endereço informado à mão.
+    Address(SocketAddr),
+    /// Um ID, a ser localizado pelo servidor de encontro.
+    Id { id: DeviceId, lookup: Arc<Lookup> },
+}
+
+/// O necessário para achar um dispositivo pelo ID.
+pub struct Lookup {
+    pub rendezvous: Rendezvous,
+    pub stun_servers: Vec<String>,
+    pub known: KnownHosts,
+}
+
+impl Lookup {
+    /// Monta a busca por ID a partir da configuração do ambiente (ver
+    /// [`opendesk_net::rendezvous_url`]). `None` se não há servidor de
+    /// encontro configurado: nesse caso só existe conexão por endereço.
+    pub fn from_env(data_dir: &std::path::Path) -> Result<Option<Arc<Self>>> {
+        let Some(url) = opendesk_net::rendezvous_url() else { return Ok(None) };
+        Ok(Some(Arc::new(Self {
+            rendezvous: Rendezvous::new(&url)?,
+            stun_servers: opendesk_net::DEFAULT_STUN_SERVERS.iter().map(|s| s.to_string()).collect(),
+            known: KnownHosts::load(data_dir),
+        })))
+    }
+}
+
+/// Por onde os dados da sessão estão passando. Em todos os casos a conexão é
+/// direta entre os dois computadores e cifrada de ponta a ponta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// Endereço digitado à mão.
+    Address,
+    /// Encontrado por ID, na mesma rede local.
+    Lan,
+    /// Encontrado por ID, atravessando a internet (NAT perfurado).
+    Internet,
+}
+
+impl Route {
+    pub fn label(self) -> &'static str {
+        match self {
+            Route::Address => "Direta, por endereço",
+            Route::Lan => "Direta, rede local",
+            Route::Internet => "Direta, ponto a ponto",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ViewerEvent {
     /// Conectado e autenticado; aguardando a pessoa no host decidir.
     Connected {
         host_name: String,
         fingerprint: Fingerprint,
+        route: Route,
     },
     Granted {
         permissions: Permissions,
@@ -70,14 +128,15 @@ pub struct Viewer {
     pub frame: Arc<Mutex<SharedFrame>>,
     commands: mpsc::UnboundedSender<Command>,
     cancel: Arc<Notify>,
+    link: Arc<Mutex<Option<quinn::Connection>>>,
 }
 
 impl Viewer {
-    /// Começa a conectar em `addr`. Os eventos chegam pelo canal devolvido.
+    /// Começa a conectar a `target`. Os eventos chegam pelo canal devolvido.
     pub fn connect(
         runtime: &tokio::runtime::Handle,
         node: Arc<Node>,
-        addr: SocketAddr,
+        target: Target,
         device_name: String,
         wants: Permissions,
         wake: Wake,
@@ -87,7 +146,8 @@ impl Viewer {
         let (events, event_rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(Notify::new());
 
-        let task = Task { node, addr, device_name, wants, frame: frame.clone(), events, wake };
+        let link = Arc::new(Mutex::new(None));
+        let task = Task { node, target, device_name, wants, frame: frame.clone(), events, wake, link: link.clone() };
         let cancelled = cancel.clone();
         runtime.spawn(async move {
             let reason = tokio::select! {
@@ -96,7 +156,12 @@ impl Viewer {
             };
             task.emit(ViewerEvent::Closed(reason));
         });
-        (Self { frame, commands, cancel }, event_rx)
+        (Self { frame, commands, cancel, link }, event_rx)
+    }
+
+    /// Latência de ida e volta medida pelo QUIC, quando já há conexão.
+    pub fn rtt(&self) -> Option<Duration> {
+        self.link.lock().unwrap().as_ref().map(quinn::Connection::rtt)
     }
 
     pub fn send_input(&self, event: InputEvent) {
@@ -126,12 +191,13 @@ impl Drop for Viewer {
 
 struct Task {
     node: Arc<Node>,
-    addr: SocketAddr,
+    target: Target,
     device_name: String,
     wants: Permissions,
     frame: Arc<Mutex<SharedFrame>>,
     events: mpsc::UnboundedSender<ViewerEvent>,
     wake: Wake,
+    link: Arc<Mutex<Option<quinn::Connection>>>,
 }
 
 impl Task {
@@ -140,9 +206,61 @@ impl Task {
         (self.wake)();
     }
 
+    /// Chega até o host: direto no endereço, ou pelo ID via servidor de
+    /// encontro, com perfuração de NAT.
+    async fn establish(&self) -> Result<(PeerConn, Route)> {
+        let (id, lookup) = match &self.target {
+            Target::Address(addr) => return Ok((self.node.connect(*addr, None).await?, Route::Address)),
+            Target::Id { id, lookup } => (*id, lookup),
+        };
+
+        let (mine, _) = self.node.candidates(&lookup.stun_servers).await;
+        let answer = lookup.rendezvous.dial(id, self.node.identity().fingerprint(), &mine).await?;
+
+        // Primeiro contato fixa a identidade; depois disso ela não pode mudar.
+        let pinned = lookup.known.get(id);
+        if let Some(pinned) = pinned
+            && pinned != answer.fingerprint
+        {
+            bail!(
+                "A identidade do computador {id} mudou desde a última conexão (era {}, agora é {}). \
+                 Isso acontece se o OpenDesk foi reinstalado lá, mas também se alguém estiver se passando por ele. \
+                 Confirme com a pessoa por outro meio antes de continuar.",
+                pinned.short(),
+                answer.fingerprint.short()
+            );
+        }
+        if answer.candidates.is_empty() {
+            bail!("O computador remoto não informou nenhum endereço para conexão.");
+        }
+
+        self.node.punch(&answer.candidates, PUNCH_FOR);
+        let (peer, addr) =
+            self.node.connect_any(&answer.candidates, Some(answer.fingerprint), CONNECT_LIMIT).await.map_err(
+                |err| {
+                    tracing::debug!("conexão direta com {id} falhou: {err:#}");
+                    anyhow!(
+                        "Não foi possível abrir uma conexão direta com esse computador. \
+                     A rede de um dos lados bloqueia conexões ponto a ponto, e o relay ainda não está disponível."
+                    )
+                },
+            )?;
+        if pinned.is_none()
+            && let Err(err) = lookup.known.remember(id, peer.fingerprint)
+        {
+            tracing::warn!("não foi possível guardar a identidade de {id}: {err}");
+        }
+        let local = match addr.ip() {
+            IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+            IpAddr::V6(ip) => ip.is_loopback(),
+        };
+        Ok((peer, if local { Route::Lan } else { Route::Internet }))
+    }
+
     async fn run(&self, mut commands: mpsc::UnboundedReceiver<Command>) -> Result<String> {
-        let peer = self.node.connect(self.addr, None).await?;
+        let (peer, route) = self.establish().await?;
         let conn = &peer.conn;
+        *self.link.lock().unwrap() = Some(conn.clone());
         // Se esta tarefa for cancelada, avisa o host em vez de deixá-lo
         // esperar o tempo limite.
         let _close_on_exit = CloseOnDrop(conn.clone());
@@ -163,7 +281,7 @@ impl Task {
             bail!("resposta inesperada do host");
         };
         let host_name: String = device_name.chars().filter(|c| !c.is_control()).take(64).collect();
-        self.emit(ViewerEvent::Connected { host_name, fingerprint: peer.fingerprint });
+        self.emit(ViewerEvent::Connected { host_name, fingerprint: peer.fingerprint, route });
 
         match recv_msg(&mut rx).await {
             Ok(HostMsg::Decision(Decision::Granted { permissions, display })) => {

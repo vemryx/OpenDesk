@@ -5,14 +5,14 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use opendesk_net::{Identity, Node};
+use opendesk_net::{DeviceId, Identity, Nat, Node, Presence};
 use opendesk_proto::control::Permissions;
 use opendesk_session::backend::SystemBackend;
 use opendesk_session::host::{Host, HostEvent};
-use opendesk_session::viewer::{Viewer, ViewerEvent};
+use opendesk_session::viewer::{Lookup, Target, Viewer, ViewerEvent};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -46,8 +46,8 @@ enum Command {
     },
     /// Conecta a um host e mede a recepção; opcionalmente salva a tela em PNG.
     View {
-        /// Endereço do host, por exemplo 192.168.0.10:47700.
-        addr: SocketAddr,
+        /// ID do host (602 758 973) ou endereço (192.168.0.10:47700).
+        target: String,
         /// Por quantos segundos receber.
         #[arg(long, default_value_t = 3.0)]
         seconds: f32,
@@ -97,11 +97,11 @@ fn main() -> Result<()> {
         }
         Command::Host { port, display, auto_accept_loopback } => {
             let identity = Arc::new(Identity::load_or_create(&data_dir)?);
-            runtime()?.block_on(host(identity, port, display, auto_accept_loopback))
+            runtime()?.block_on(host(identity, &data_dir, port, display, auto_accept_loopback))
         }
-        Command::View { addr, seconds, out, control } => {
+        Command::View { target, seconds, out, control } => {
             let identity = Arc::new(Identity::load_or_create(&data_dir)?);
-            runtime()?.block_on(view(identity, addr, seconds, out, control))
+            runtime()?.block_on(view(identity, &data_dir, &target, seconds, out, control))
         }
     }
 }
@@ -114,13 +114,32 @@ fn device_name() -> String {
     std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "dispositivo".into())
 }
 
-async fn host(identity: Arc<Identity>, port: u16, display: usize, auto: Option<AutoAccept>) -> Result<()> {
+async fn host(
+    identity: Arc<Identity>,
+    data_dir: &Path,
+    port: u16,
+    display: usize,
+    auto: Option<AutoAccept>,
+) -> Result<()> {
     let ip = if auto.is_some() { IpAddr::V4(Ipv4Addr::LOCALHOST) } else { IpAddr::V4(Ipv4Addr::UNSPECIFIED) };
     let node = Arc::new(Node::bind(identity.clone(), SocketAddr::new(ip, port))?);
-    println!("OpenDesk {} — ID {}", env!("CARGO_PKG_VERSION"), identity.device_id());
+    println!("OpenDesk {}", env!("CARGO_PKG_VERSION"));
     println!("Escutando em {}", node.local_addr()?);
     if auto.is_some() {
         println!("MODO DE TESTE: aceitando automaticamente, somente a partir deste computador.");
+    }
+
+    // Com um servidor de encontro configurado, este computador também pode
+    // ser achado pelo ID.
+    match Lookup::from_env(data_dir)? {
+        Some(lookup) => {
+            let node = node.clone();
+            tokio::spawn(async move {
+                let servers = lookup.stun_servers.clone();
+                lookup.rendezvous.serve(node, servers, print_presence).await;
+            });
+        }
+        None => println!("Sem servidor de encontro: só é possível conectar pelo endereço acima."),
     }
 
     let (host, mut events) = Host::new(node, Arc::new(SystemBackend { display }), device_name(), Arc::new(|| {}));
@@ -153,6 +172,20 @@ async fn host(identity: Arc<Identity>, port: u16, display: usize, auto: Option<A
     Ok(())
 }
 
+fn print_presence(presence: Presence) {
+    match presence {
+        Presence::Connecting => println!("Conectando ao servidor de encontro…"),
+        Presence::Online { id, nat } => {
+            let note = match nat {
+                Nat::Symmetric => " (NAT simétrico: conexões pela internet podem falhar sem relay)",
+                Nat::Stable | Nat::Unknown => "",
+            };
+            println!("Online. ID deste computador: {id}{note}");
+        }
+        Presence::Offline(reason) => println!("Fora do servidor de encontro: {reason}"),
+    }
+}
+
 fn ask(wants: Permissions) -> Result<Option<Permissions>> {
     let options =
         if wants.control { "[v] só ver  [c] ver e controlar  [n] recusar" } else { "[v] permitir ver  [n] recusar" };
@@ -169,20 +202,29 @@ fn ask(wants: Permissions) -> Result<Option<Permissions>> {
 
 async fn view(
     identity: Arc<Identity>,
-    addr: SocketAddr,
+    data_dir: &Path,
+    target: &str,
     seconds: f32,
     out: Option<PathBuf>,
     control: bool,
 ) -> Result<()> {
+    let target = if let Some(id) = DeviceId::parse(target) {
+        let lookup = Lookup::from_env(data_dir)?
+            .context("conectar por ID exige um servidor de encontro (defina OPENDESK_RENDEZVOUS)")?;
+        println!("Procurando {id} em {}…", lookup.rendezvous.url());
+        Target::Id { id, lookup }
+    } else {
+        Target::Address(target.parse().with_context(|| format!("\"{target}\" não é um ID nem um endereço ip:porta"))?)
+    };
     let node = Arc::new(Node::bind(identity, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?);
     let wants = if control { Permissions::FULL } else { Permissions::VIEW_ONLY };
     let (viewer, mut events) =
-        Viewer::connect(&tokio::runtime::Handle::current(), node, addr, device_name(), wants, Arc::new(|| {}));
+        Viewer::connect(&tokio::runtime::Handle::current(), node, target, device_name(), wants, Arc::new(|| {}));
 
     loop {
         match events.recv().await.context("a sessão terminou sem aviso")? {
-            ViewerEvent::Connected { host_name, fingerprint } => {
-                println!("Conectado a \"{host_name}\" — ID {} ({})", fingerprint.device_id(), fingerprint.short());
+            ViewerEvent::Connected { host_name, fingerprint, route } => {
+                println!("Conectado a \"{host_name}\" ({}). Rota: {}", fingerprint.short(), route.label());
                 println!("Aguardando autorização no computador remoto…");
             }
             ViewerEvent::Granted { permissions, display } => {
@@ -210,6 +252,9 @@ async fn view(
     let frame = viewer.frame.lock().unwrap();
     let elapsed = started.elapsed().as_secs_f64();
     println!("Primeiro quadro em {:.0} ms", first_frame.as_secs_f64() * 1000.0);
+    if let Some(rtt) = viewer.rtt() {
+        println!("Latência (ida e volta): {:.1} ms", rtt.as_secs_f64() * 1000.0);
+    }
     println!(
         "{} quadros em {:.1} s ({:.1} qps), {:.2} MB recebidos ({:.2} Mbit/s)",
         frame.frames,

@@ -1,0 +1,18 @@
+{
+  "name": "opendesk-rendezvous",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Servidor de encontro do OpenDesk: apresenta dois dispositivos um ao outro. Nunca vê o conteúdo das sessões.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --port 8787",
+    "deploy": "wrangler deploy",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5",
+    "typescript": "^7",
+    "wrangler": "^4"
+  }
+}
