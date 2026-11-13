@@ -27,7 +27,7 @@ Acesso remoto ponto a ponto, gratuito e de código aberto. Uma alternativa ao An
 
 ## Usar
 
-No computador que será acessado, abra o OpenDesk e informe a quem vai acessar o **ID** (ou o endereço) que aparece em "ID deste computador". No outro computador, digite-o em "Acessar outro computador" e clique em **Conectar**. O primeiro computador mostra o pedido; aprove. A janela, compacta na tela inicial, maximiza-se durante a sessão e volta ao tamanho normal quando ela termina.
+No computador que será acessado, abra o OpenDesk e informe a quem vai acessar o **ID** (ou o endereço) que aparece em "ID deste computador". No outro computador, digite-o em "Acessar outro computador" e clique em **Conectar**. O primeiro computador mostra o pedido; aprove. A janela maximiza-se durante a sessão e volta ao tamanho normal quando ela termina.
 
 O app segue o tema claro ou escuro do Windows; `OPENDESK_THEME=light` ou `dark` fixa um deles.
 

@@ -1,6 +1,6 @@
 //! Estado e telas do aplicativo.
 //!
-//! Uma janela só, compacta: a tela inicial (o ID deste computador ao lado do
+//! Uma janela só e enxuta: a tela inicial (o ID deste computador ao lado do
 //! campo para acessar outro) dá lugar à visão remota, em janela maximizada,
 //! quando uma sessão de saída é autorizada. Pedidos de entrada aparecem como
 //! diálogo modal por cima de qualquer tela, e uma sessão de entrada ativa fica
@@ -29,13 +29,15 @@ use tokio::sync::{mpsc, oneshot};
 const REQUEST_TTL: Duration = Duration::from_secs(60);
 
 /// Tamanho da janela na tela inicial.
-pub const HOME_SIZE: [f32; 2] = [720.0, 360.0];
+pub const HOME_SIZE: [f32; 2] = [940.0, 600.0];
 /// Largura do conteúdo da coluna "este computador".
-const SIDE_WIDTH: f32 = 232.0;
+const SIDE_WIDTH: f32 = 264.0;
+/// O formulário não estica além disto em janelas largas.
+const FORM_WIDTH: f32 = 520.0;
 /// Altura do símbolo da marca e o respiro abaixo dele. A coluna da direita
 /// desce o mesmo tanto, para os rótulos das duas colunas ficarem alinhados.
-const LOGO_HEIGHT: f32 = 26.0;
-const LOGO_GAP: f32 = 26.0;
+const LOGO_HEIGHT: f32 = 30.0;
+const LOGO_GAP: f32 = 36.0;
 /// Largura do botão ao lado do campo (igual para "Conectar" e "Cancelar",
 /// para o campo não mudar de tamanho entre os estados).
 const ACTION_WIDTH: f32 = 104.0;
@@ -438,15 +440,15 @@ impl eframe::App for App {
 
 impl App {
     fn home(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        let margin = |x: i8| Margin { left: x, right: x, top: 20, bottom: 14 };
+        let margin = |x: i8| Margin { left: x, right: x, top: 28, bottom: 20 };
         egui::Panel::left("side")
             .exact_size(SIDE_WIDTH)
             .resizable(false)
             .show_separator_line(false)
-            .frame(egui::Frame::new().fill(p.side).inner_margin(margin(22)))
+            .frame(egui::Frame::new().fill(p.side).inner_margin(margin(28)))
             .show(ui, |ui| self.this_computer(ui, p));
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(p.bg).inner_margin(margin(28)))
+            .frame(egui::Frame::new().fill(p.bg).inner_margin(margin(40)))
             .show(ui, |ui| self.connect_form(ui, p));
     }
 
@@ -562,7 +564,7 @@ impl App {
         let (mut connect, mut cancel) = (false, false);
         ui.horizontal(|ui| {
             ui.spacing_mut().interact_size.y = 36.0;
-            let width = ui.available_width() - ACTION_WIDTH - ui.spacing().item_spacing.x;
+            let width = ui.available_width().min(FORM_WIDTH) - ACTION_WIDTH - ui.spacing().item_spacing.x;
             let field = ui
                 .add_enabled(
                     !busy,
@@ -614,7 +616,7 @@ impl App {
                 .corner_radius(CornerRadius::same(6))
                 .inner_margin(Margin::symmetric(10, 8))
                 .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
+                    ui.set_width(ui.available_width().min(FORM_WIDTH) - 20.0);
                     ui.label(RichText::new(notice).color(p.text));
                 });
         }

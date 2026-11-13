@@ -16,7 +16,7 @@ fn main() -> eframe::Result {
         .with_title("OpenDesk")
         .with_icon(icon())
         .with_inner_size(app::HOME_SIZE)
-        .with_min_inner_size([640.0, 340.0]);
+        .with_min_inner_size([720.0, 460.0]);
     // Para desenvolvimento e testes: `OPENDESK_WINDOW_POS=x,y` abre a janela
     // nessa posição e sem tomar o foco de quem está usando o computador.
     let position = std::env::var("OPENDESK_WINDOW_POS").ok().and_then(|value| {
