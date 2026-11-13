@@ -1,11 +1,14 @@
+use crate::auth::{SessionKey, ViewerExchange, stretch};
 use crate::{Wake, describe_close};
 use anyhow::{Context, Result, anyhow, bail};
 use opendesk_codec::decode_packet;
 use opendesk_net::{DeviceId, Fingerprint, KnownHosts, Node, PeerConn, Rendezvous};
 use opendesk_proto::PROTOCOL_VERSION;
-use opendesk_proto::control::{Decision, DenyReason, DisplayDesc, Hello, HostMsg, InputEvent, Permissions, ViewerMsg};
+use opendesk_proto::control::{
+    Decision, DenyReason, DisplayDesc, Hello, HostMsg, InputEvent, MAX_CLIPBOARD_TEXT, Permissions, ViewerMsg,
+};
 use opendesk_proto::video::FramePacket;
-use opendesk_proto::wire::{MAX_VIDEO_FRAME, read_frame, recv_msg, send_msg};
+use opendesk_proto::wire::{MAX_VIDEO_FRAME, read_frame, send_msg};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -114,9 +117,25 @@ pub enum ViewerEvent {
         host_name: String,
         fingerprint: Fingerprint,
         route: Route,
+        /// O host aceita senha de acesso não supervisionado.
+        password: bool,
     },
     Granted {
         permissions: Permissions,
+        display: DisplayDesc,
+        /// Qual monitor do host está sendo mostrado, e quantos ele tem.
+        index: u8,
+        displays: u8,
+    },
+    /// A senha enviada não conferiu. `retry`: dá para tentar de novo agora.
+    PasswordRejected {
+        retry: bool,
+    },
+    /// Texto copiado no computador remoto.
+    Clipboard(String),
+    /// O host passou a mostrar outro monitor.
+    Display {
+        index: u8,
         display: DisplayDesc,
     },
     Denied(DenyReason),
@@ -127,6 +146,10 @@ pub enum ViewerEvent {
 enum Command {
     Input(InputEvent),
     Keyframe,
+    Password(String),
+    Clipboard(String),
+    SelectDisplay(u8),
+    Lock,
 }
 
 #[derive(Clone)]
@@ -191,6 +214,28 @@ impl Viewer {
 
     pub fn request_keyframe(&self) {
         let _ = self.commands.send(Command::Keyframe);
+    }
+
+    /// Tenta entrar com a senha de acesso não supervisionado. Só tem efeito
+    /// enquanto o pedido aguarda resposta e se o host aceita senha. O
+    /// resultado chega como `Granted` ou `PasswordRejected`.
+    pub fn submit_password(&self, password: String) {
+        let _ = self.commands.send(Command::Password(password));
+    }
+
+    /// Envia ao host um texto copiado aqui.
+    pub fn send_clipboard(&self, text: String) {
+        let _ = self.commands.send(Command::Clipboard(text));
+    }
+
+    /// Pede para ver o monitor `index` do host.
+    pub fn select_display(&self, index: u8) {
+        let _ = self.commands.send(Command::SelectDisplay(index));
+    }
+
+    /// Pede para bloquear a estação remota.
+    pub fn lock_remote(&self) {
+        let _ = self.commands.send(Command::Lock);
     }
 
     pub fn disconnect(&self) {
@@ -311,7 +356,8 @@ impl Task {
         // esperar o tempo limite.
         let _close_on_exit = CloseOnDrop(conn.clone());
 
-        let (mut tx, mut rx) = conn.open_bi().await.context("abrir canal de controle")?;
+        let (mut tx, rx) = conn.open_bi().await.context("abrir canal de controle")?;
+        let mut inbox = crate::inbox::<HostMsg>(rx);
         send_msg(
             &mut tx,
             &ViewerMsg::Hello(Hello {
@@ -323,39 +369,111 @@ impl Task {
         )
         .await?;
 
-        let HostMsg::Welcome { device_name, .. } = recv_msg(&mut rx).await.context("aguardar o host")? else {
+        let Some(HostMsg::Welcome { device_name, password: challenge, .. }) = inbox.recv().await else {
             bail!("resposta inesperada do host");
         };
         let host_name: String = device_name.chars().filter(|c| !c.is_control()).take(64).collect();
-        self.emit(ViewerEvent::Connected { host_name, fingerprint: peer.fingerprint, route });
+        self.emit(ViewerEvent::Connected {
+            host_name,
+            fingerprint: peer.fingerprint,
+            route,
+            password: challenge.is_some(),
+        });
 
-        match recv_msg(&mut rx).await {
-            Ok(HostMsg::Decision(Decision::Granted { permissions, display })) => {
-                self.emit(ViewerEvent::Granted { permissions, display });
-            }
-            Ok(HostMsg::Decision(Decision::Denied { reason })) => {
-                self.emit(ViewerEvent::Denied(reason));
-                return Ok(match reason {
-                    DenyReason::Rejected => "O pedido de conexão foi recusado.",
-                    DenyReason::Timeout => "Ninguém respondeu ao pedido de conexão.",
-                    DenyReason::VersionMismatch => "As versões do OpenDesk nos dois lados são incompatíveis.",
-                    DenyReason::CaptureUnavailable => "O computador remoto não conseguiu capturar a tela.",
-                    DenyReason::Busy => {
-                        "O computador remoto já está em outra sessão. Tente de novo quando ela terminar."
+        // Até a decisão chegar, a pessoa pode tentar a senha de acesso não
+        // supervisionado quantas vezes o host deixar.
+        let me = self.node.identity().fingerprint();
+        let mut exchange: Option<ViewerExchange> = None;
+        let mut key: Option<SessionKey> = None;
+        let permissions = loop {
+            tokio::select! {
+                msg = inbox.recv() => match msg {
+                    Some(HostMsg::Decision(Decision::Granted { permissions, display, index, displays })) => {
+                        self.emit(ViewerEvent::Granted { permissions, display, index, displays });
+                        break permissions;
                     }
-                }
-                .into());
+                    Some(HostMsg::Decision(Decision::Denied { reason })) => {
+                        self.emit(ViewerEvent::Denied(reason));
+                        return Ok(match reason {
+                            DenyReason::Rejected => "O pedido de conexão foi recusado.",
+                            DenyReason::Timeout => "Ninguém respondeu ao pedido de conexão.",
+                            DenyReason::VersionMismatch => "As versões do OpenDesk nos dois lados são incompatíveis.",
+                            DenyReason::CaptureUnavailable => "O computador remoto não conseguiu capturar a tela.",
+                            DenyReason::Busy => {
+                                "O computador remoto já está em outra sessão. Tente de novo quando ela terminar."
+                            }
+                        }
+                        .into());
+                    }
+                    Some(HostMsg::Auth(message)) => {
+                        let Some(started) = exchange.take() else { continue };
+                        match started.finish(&message) {
+                            Ok((session_key, proof)) => {
+                                key = Some(session_key);
+                                send_msg(&mut tx, &ViewerMsg::AuthConfirm(proof)).await?;
+                            }
+                            Err(_) => self.emit(ViewerEvent::PasswordRejected { retry: true }),
+                        }
+                    }
+                    Some(HostMsg::AuthOk(proof)) => {
+                        // Quem aceita a senha tem de provar que também a conhece.
+                        if !key.take().is_some_and(|key| key.host_is_genuine(&proof)) {
+                            bail!(
+                                "O computador remoto aceitou a senha sem provar que a conhece. \
+                                 A conexão foi encerrada por segurança."
+                            );
+                        }
+                    }
+                    Some(HostMsg::AuthFailed { retry }) => {
+                        exchange = None;
+                        key = None;
+                        self.emit(ViewerEvent::PasswordRejected { retry });
+                    }
+                    Some(_) => {}
+                    None => {
+                        return Ok(match conn.close_reason() {
+                            Some(err) => describe_close(&err),
+                            None => "O computador remoto fechou a conexão.".into(),
+                        });
+                    }
+                },
+                command = commands.recv() => match command {
+                    Some(Command::Password(password)) => {
+                        let Some(challenge) = challenge else { continue };
+                        // Esticar a senha custa caro de propósito: fora do executor.
+                        let secret = tokio::task::spawn_blocking(move || stretch(&password, challenge))
+                            .await
+                            .context("derivar a senha")?;
+                        let (started, message) = ViewerExchange::start(&secret, me, peer.fingerprint);
+                        exchange = Some(started);
+                        send_msg(&mut tx, &ViewerMsg::Auth(message)).await?;
+                    }
+                    Some(_) => {}
+                    // O dono da sessão foi descartado.
+                    None => {
+                        let _ = send_msg(&mut tx, &ViewerMsg::Bye).await;
+                        return Ok("Sessão encerrada.".into());
+                    }
+                },
             }
-            Ok(_) => bail!("resposta inesperada do host"),
-            Err(_) => {
-                return Ok(match conn.close_reason() {
-                    Some(err) => describe_close(&err),
-                    None => "O computador remoto fechou a conexão.".into(),
-                });
-            }
-        }
+        };
 
         let video = self.receive_video(conn);
+
+        // O que o host manda durante a sessão, além do vídeo.
+        let incoming = async {
+            loop {
+                match inbox.recv().await {
+                    Some(HostMsg::Clipboard(text)) if permissions.clipboard && text.len() <= MAX_CLIPBOARD_TEXT => {
+                        self.emit(ViewerEvent::Clipboard(text));
+                    }
+                    Some(HostMsg::Display { index, display }) => self.emit(ViewerEvent::Display { index, display }),
+                    Some(_) => {}
+                    // Canal fechado: quem informa o motivo é a conexão.
+                    None => std::future::pending::<()>().await,
+                }
+            }
+        };
 
         let outgoing = async {
             while let Some(mut command) = commands.recv().await {
@@ -385,6 +503,7 @@ impl Task {
                 Ok(()) => "Sessão encerrada.".into(),
                 Err(err) => format!("{err:#}"),
             },
+            () = incoming => unreachable!("o laço de entrada só termina com a sessão"),
             closed = conn.closed() => describe_close(&closed),
         };
         Ok(reason)
@@ -443,6 +562,11 @@ async fn send_command(tx: &mut quinn::SendStream, command: &Command) -> Result<(
     let msg = match command {
         Command::Input(event) => ViewerMsg::Input(*event),
         Command::Keyframe => ViewerMsg::RequestKeyframe,
+        Command::Clipboard(text) if text.len() <= MAX_CLIPBOARD_TEXT => ViewerMsg::Clipboard(text.clone()),
+        Command::SelectDisplay(index) => ViewerMsg::SelectDisplay(*index),
+        Command::Lock => ViewerMsg::Lock,
+        // Texto grande demais, ou senha depois de a sessão já ter começado.
+        Command::Clipboard(_) | Command::Password(_) => return Ok(()),
     };
     send_msg(tx, &msg).await.context("enviar comando")
 }

@@ -2,18 +2,40 @@
 //!
 //! * [`host`] — aceita conexões, **pede autorização a quem está no
 //!   computador** e, se concedida, transmite a tela e aplica a entrada
-//!   recebida. Não existe caminho de código que inicie uma sessão sem passar
-//!   por essa decisão.
+//!   recebida. O único outro caminho para uma sessão é a senha de acesso não
+//!   supervisionado, que vem desligada e precisa ser definida de propósito.
 //! * [`viewer`] — conecta a um host, mantém o framebuffer remoto e envia
 //!   mouse e teclado.
+//! * [`auth`] — a senha de acesso não supervisionado (SPAKE2).
 //! * [`backend`] — de onde vêm os quadros e para onde vai a entrada. A
 //!   implementação real usa `opendesk-platform`; os testes usam uma falsa.
 
+pub mod auth;
 pub mod backend;
 pub mod host;
 pub mod viewer;
 
 use std::sync::Arc;
+use tokio::sync::mpsc;
+
+/// Lê as mensagens de um canal de controle numa tarefa própria e as entrega
+/// por uma fila. Ler direto num `select!` perderia pedaços de mensagem quando
+/// outro ramo vencesse no meio da leitura; receber da fila não tem esse risco.
+/// A fila fecha quando o canal fecha ou chega algo inválido.
+pub(crate) fn inbox<M>(mut rx: quinn::RecvStream) -> mpsc::Receiver<M>
+where
+    M: serde::de::DeserializeOwned + Send + 'static,
+{
+    let (tx, messages) = mpsc::channel(256);
+    tokio::spawn(async move {
+        while let Ok(msg) = opendesk_proto::wire::recv_msg::<_, M>(&mut rx).await {
+            if tx.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+    messages
+}
 
 /// Chamado sempre que há algo novo para a interface (um evento ou um quadro).
 /// A interface usa isto para pedir um redesenho.

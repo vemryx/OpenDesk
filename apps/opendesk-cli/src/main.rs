@@ -7,8 +7,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use opendesk_net::{DeviceId, Identity, Nat, Node, Presence};
 use opendesk_proto::control::Permissions;
+use opendesk_session::auth::PasswordAccess;
 use opendesk_session::backend::SystemBackend;
-use opendesk_session::host::{Host, HostEvent};
+use opendesk_session::host::{Host, HostEvent, Unattended};
 use opendesk_session::viewer::{Lookup, Target, Viewer, ViewerEvent};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -43,6 +44,13 @@ enum Command {
         /// 127.0.0.1, então nada fora deste computador consegue conectar.
         #[arg(long, value_enum)]
         auto_accept_loopback: Option<AutoAccept>,
+        /// Liga o acesso não supervisionado com esta senha (mínimo de 8
+        /// caracteres): quem souber a senha entra sem ninguém aprovar.
+        #[arg(long, env = "OPENDESK_PASSWORD")]
+        password: Option<String>,
+        /// Escuta só em 127.0.0.1: nada fora deste computador conecta.
+        #[arg(long)]
+        loopback: bool,
     },
     /// Conecta a um host e mede a recepção; opcionalmente salva a tela em PNG.
     View {
@@ -57,6 +65,9 @@ enum Command {
         /// Pede também controle de mouse e teclado.
         #[arg(long)]
         control: bool,
+        /// Entra com a senha de acesso não supervisionado do host.
+        #[arg(long, env = "OPENDESK_PASSWORD")]
+        password: Option<String>,
     },
 }
 
@@ -95,13 +106,13 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Host { port, display, auto_accept_loopback } => {
+        Command::Host { port, display, auto_accept_loopback, password, loopback } => {
             let identity = Arc::new(Identity::load_or_create(&data_dir)?);
-            runtime()?.block_on(host(identity, &data_dir, port, display, auto_accept_loopback))
+            runtime()?.block_on(host(identity, &data_dir, port, display, auto_accept_loopback, password, loopback))
         }
-        Command::View { target, seconds, out, control } => {
+        Command::View { target, seconds, out, control, password } => {
             let identity = Arc::new(Identity::load_or_create(&data_dir)?);
-            runtime()?.block_on(view(identity, &data_dir, &target, seconds, out, control))
+            runtime()?.block_on(view(identity, &data_dir, &target, seconds, out, control, password))
         }
     }
 }
@@ -120,8 +131,11 @@ async fn host(
     port: u16,
     display: usize,
     auto: Option<AutoAccept>,
+    password: Option<String>,
+    loopback: bool,
 ) -> Result<()> {
-    let ip = if auto.is_some() { IpAddr::V4(Ipv4Addr::LOCALHOST) } else { IpAddr::V4(Ipv4Addr::UNSPECIFIED) };
+    let local_only = auto.is_some() || loopback;
+    let ip = if local_only { IpAddr::V4(Ipv4Addr::LOCALHOST) } else { IpAddr::V4(Ipv4Addr::UNSPECIFIED) };
     let node = Arc::new(Node::bind(identity.clone(), SocketAddr::new(ip, port))?);
     println!("OpenDesk {}", env!("CARGO_PKG_VERSION"));
     println!("Escutando em {}", node.local_addr()?);
@@ -143,6 +157,15 @@ async fn host(
     }
 
     let (host, mut events) = Host::new(node, Arc::new(SystemBackend { display }), device_name(), Arc::new(|| {}));
+    // Com senha, este é um host sem ninguém na frente: os pedidos ficam
+    // aguardando (até expirar) em vez de perguntar no terminal.
+    let headless = password.is_some();
+    let mut unanswered = Vec::new();
+    if let Some(password) = password {
+        let access = PasswordAccess::create(&password)?;
+        host.set_unattended(Some(Unattended { access, permissions: Permissions::FULL }));
+        println!("Acesso não supervisionado LIGADO: quem souber a senha entra sem aprovação.");
+    }
     tokio::spawn(host.clone().serve());
 
     while let Some(event) = events.recv().await {
@@ -158,13 +181,22 @@ async fn host(
                 let answer = match auto {
                     Some(AutoAccept::View) => Some(Permissions::VIEW_ONLY),
                     Some(AutoAccept::Control) => Some(Permissions::FULL),
+                    None if headless => {
+                        println!("Aguardando a senha de acesso (ninguém para aprovar).");
+                        unanswered.push(reply);
+                        continue;
+                    }
                     None => tokio::task::spawn_blocking(move || ask(peer.wants)).await??,
                 };
                 let _ = reply.send(answer);
             }
-            HostEvent::Started { peer, permissions, .. } => {
+            HostEvent::Started { peer, permissions, by_password, .. } => {
                 let mode = if permissions.control { "com controle" } else { "somente visualização" };
-                println!("Sessão iniciada com \"{}\" ({mode}). Ctrl+C encerra.", peer.name);
+                let how = if by_password { ", pela senha" } else { "" };
+                println!("Sessão iniciada com \"{}\" ({mode}{how}). Ctrl+C encerra.", peer.name);
+            }
+            HostEvent::PasswordFailed { peer, .. } => {
+                println!("Senha de acesso errada vinda de \"{}\" ({}).", peer.name, peer.fingerprint.short());
             }
             HostEvent::Ended { reason, .. } => println!("Sessão encerrada: {reason}"),
         }
@@ -207,6 +239,7 @@ async fn view(
     seconds: f32,
     out: Option<PathBuf>,
     control: bool,
+    password: Option<String>,
 ) -> Result<()> {
     let target = if let Some(id) = DeviceId::parse(target) {
         let lookup = Lookup::from_env(data_dir)?
@@ -223,16 +256,35 @@ async fn view(
 
     loop {
         match events.recv().await.context("a sessão terminou sem aviso")? {
-            ViewerEvent::Connected { host_name, fingerprint, route } => {
+            ViewerEvent::Connected { host_name, fingerprint, route, password: accepts_password } => {
                 println!("Conectado a \"{host_name}\" ({}). Rota: {}", fingerprint.short(), route.label());
-                println!("Aguardando autorização no computador remoto…");
+                match &password {
+                    Some(password) if accepts_password => {
+                        println!("Entrando com a senha…");
+                        viewer.submit_password(password.clone());
+                    }
+                    Some(_) => println!("O host não aceita senha. Aguardando autorização no computador remoto…"),
+                    None => println!("Aguardando autorização no computador remoto…"),
+                }
             }
-            ViewerEvent::Granted { permissions, display } => {
+            ViewerEvent::Granted { permissions, display, index, displays } => {
                 let mode = if permissions.control { "com controle" } else { "somente visualização" };
-                println!("Autorizado ({mode}). Tela remota: {} {}x{}", display.name, display.width, display.height);
+                println!(
+                    "Autorizado ({mode}). Tela remota: {} {}x{} (monitor {} de {displays})",
+                    display.name,
+                    display.width,
+                    display.height,
+                    index + 1
+                );
                 break;
             }
-            ViewerEvent::Denied(_) => {}
+            ViewerEvent::PasswordRejected { retry } => {
+                bail!(
+                    "A senha não foi aceita{}.",
+                    if retry { "" } else { " e o host bloqueou novas tentativas por enquanto" }
+                )
+            }
+            ViewerEvent::Denied(_) | ViewerEvent::Clipboard(_) | ViewerEvent::Display { .. } => {}
             ViewerEvent::Closed(reason) => bail!("{reason}"),
         }
     }

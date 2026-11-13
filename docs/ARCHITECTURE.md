@@ -125,13 +125,28 @@ Para quando a conexão direta não passa. Como a sessão é QUIC com TLS de pont
 
 O que ainda não existe são os **relays comunitários**: uma lista pública de relays voluntários que o aplicativo use sozinho. Para isso faltam tokens emitidos pelo servidor de encontro (hoje qualquer par que conheça o endereço de um relay pode usá-lo, dentro dos limites), medição de saúde para escolher um relay bom, e um jeito de publicar e retirar relays da lista. Enquanto isso não existir, o relay é "traga o seu", e o OpenDesk não promete conexão em qualquer rede sem ele.
 
+## Acesso não supervisionado
+
+Vem desligado. Ligado, quem souber a senha de acesso entra sem que alguém aprove; o pedido aparece na tela do mesmo jeito, e a faixa de "alguém está acessando" diz que a entrada foi pela senha.
+
+- **A senha nunca trafega.** Os dois lados rodam SPAKE2 (um PAKE) sobre a senha esticada com PBKDF2-HMAC-SHA256 (600 mil iterações, sal por host). Quem não sabe a senha ganha um palpite por tentativa, e quem observa ou intermedeia a troca não leva nada que permita testar senhas por conta própria.
+- **Amarrada às identidades.** As impressões digitais TLS dos dois dispositivos entram como identidades do SPAKE2. Um intermediário com outro certificado faz as chaves divergirem, mesmo repassando as mensagens intactas. Há confirmação nos dois sentidos: o host só responde depois de conferir a prova do visualizador, e o visualizador confere que o host também conhece a senha.
+- **Tentativas limitadas.** Três erros por conexão; cinco erros em dez minutos, somando todos os dispositivos, e o host para de aceitar senha por dez minutos. Cada erro vai para o histórico.
+- **O que fica no disco.** O sal e a senha esticada, em `unattended.json`, separado das configurações. Não revela a senha digitada, mas é equivalente a ela para este host: quem copia esse arquivo consegue entrar. Protegê-lo com DPAPI está no roteiro, junto com a chave do dispositivo.
+- **A senha não passa por cima das políticas.** Com "aceitar pedidos" desligado a senha não vale; com "permitir controle" desligado ela só libera a visualização.
+
+O código está em `crates/opendesk-session/src/auth.rs`, com testes para senha certa, errada, troca repassada por um intermediário e o bloqueio por tentativas.
+
 ## Protocolo de sessão
 
 Uma conexão QUIC, dois canais:
 
 1. **Controle** (stream bidirecional, aberto pelo visualizador). Mensagens `postcard` prefixadas por tamanho.
-   `Hello` → `Welcome` → *(pessoa decide)* → `Decision` → `Input*` / `RequestKeyframe` / `Bye`.
+   `Hello` → `Welcome` → *(a pessoa decide, ou o visualizador prova a senha: `Auth` ⇄ `Auth`, `AuthConfirm` → `AuthOk`)* → `Decision` → sessão.
+   Durante a sessão: `Input`, `RequestKeyframe`, `Clipboard` (nos dois sentidos, só texto, até 100 kB), `SelectDisplay` → `Display`, `Lock`, `Bye`.
 2. **Vídeo** (stream unidirecional, aberto pelo host após autorizar). Pacotes binários com retângulos a aplicar sobre o quadro anterior.
+
+As permissões são conferidas no host: entrada e bloqueio remoto exigem a permissão de controle, e a área de transferência só é lida ou gravada com a permissão correspondente (só o que for copiado depois de a sessão começar atravessa). Trocar de monitor reinicia a captura; os quadros da captura anterior que ainda estiverem a caminho são descartados por um número de geração.
 
 Posições do mouse viajam normalizadas (`0..=65535` sobre o monitor compartilhado) e teclas viajam como scancode físico, de modo que resolução, escala e layout de teclado de quem vê não interferem.
 
@@ -182,9 +197,9 @@ Onde o OpenDesk diverge de propósito: QUIC em vez de protocolo próprio sobre T
 1. **Relays comunitários**: lista pública, tokens emitidos pelo servidor de encontro, escolha automática.
 2. **Desempenho**: codec de vídeo na GPU, qualidade adaptativa, teto de bitrate.
 3. **Vários visualizadores** no mesmo host, compartilhando uma única captura de tela.
-4. **Experiência**: área de transferência, transferência de arquivos, múltiplos monitores, cursor remoto, catálogo de computadores recentes.
-5. **Segurança**: gerenciar hosts fixados pela interface, chave protegida por DPAPI, registro local de sessões.
-6. **Serviço Windows**: UAC e tela de logon, acesso não supervisionado com senha (PAKE).
+4. **Experiência**: transferência de arquivos, área de transferência com imagens e arquivos, cursor remoto, conversa por texto, gravação da sessão, apelidos e favoritos nos computadores recentes.
+5. **Segurança**: gerenciar hosts fixados pela interface, chave e senha de acesso protegidas por DPAPI, lista de dispositivos autorizados, segundo fator.
+6. **Serviço Windows**: UAC, tela de logon e Ctrl+Alt+Del; é o que falta para o acesso não supervisionado funcionar com o computador bloqueado ou antes do login.
 7. **Distribuição**: releases automáticos, assinatura de código (SignPath para projetos abertos), Linux e macOS, domínio próprio para o servidor de encontro.
 
 ## Limitações conhecidas
@@ -196,6 +211,8 @@ Onde o OpenDesk diverge de propósito: QUIC em vez de protocolo próprio sobre T
 - O host atende um visualizador por vez (o Windows só permite uma captura de tela por processo); um segundo pedido recebe "ocupado".
 - IPv6 não é usado.
 - Janelas elevadas e o prompt do UAC não recebem entrada nem são capturados (exige o serviço).
-- Monitores rotacionados não são corrigidos; só o monitor principal é compartilhado pela interface.
+- Monitores rotacionados não são corrigidos.
+- O acesso não supervisionado depende de o OpenDesk estar aberto numa sessão do Windows desbloqueada: sem o serviço, não há como ver a tela de bloqueio nem a de login.
+- A área de transferência sincroniza só texto.
 - O ponteiro do mouse remoto não é desenhado; o cursor local faz esse papel.
 - Reduzir uma tela 4K numa janela pequena usa filtro bilinear simples, sem mipmaps.

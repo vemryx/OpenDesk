@@ -20,7 +20,7 @@ pub mod wire;
 pub const ALPN: &[u8] = b"opendesk/1";
 
 /// Versão do protocolo de sessão. Mude ao quebrar compatibilidade.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Porta UDP padrão em que um OpenDesk escuta conexões diretas.
 pub const DEFAULT_PORT: u16 = 47700;

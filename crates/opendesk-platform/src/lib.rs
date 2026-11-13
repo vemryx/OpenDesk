@@ -6,6 +6,7 @@
 //! * [`input`] — injeção de mouse e teclado no host (Windows: `SendInput`).
 //! * [`keyboard`] — captura de teclado no visualizador, para que atalhos como
 //!   Alt+Tab e a tecla Windows cheguem ao computador remoto.
+//! * [`clipboard`] — texto da área de transferência.
 //! * [`system`] — abrir junto com o sistema, bloquear a estação, hora local.
 
 #[cfg(windows)]
@@ -54,6 +55,11 @@ pub mod keyboard {
         pub extended: bool,
         pub down: bool,
     }
+}
+
+/// Texto da área de transferência do sistema.
+pub mod clipboard {
+    pub use crate::imp::clipboard::{sequence, set_text, text};
 }
 
 pub mod system {

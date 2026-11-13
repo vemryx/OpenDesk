@@ -22,11 +22,13 @@ Acesso remoto ponto a ponto, gratuito e de código aberto. Uma alternativa ao An
 - **Conexão por ID**: um servidor de encontro apresenta os dois computadores e eles conectam direto um ao outro, perfurando o NAT. O servidor nunca vê a sessão.
 - **Relay opcional**: se a rede não deixar conectar direto, a sessão passa por um relay que você mesmo hospeda. Ele só repassa pacotes cifrados e não consegue ler nada.
 - **Transparência**: a barra da sessão mostra a rota (direta por endereço, rede local, ponto a ponto ou via relay), a latência, os quadros por segundo e o bitrate; codec e resolução aparecem ao passar o ponteiro.
-- **Autorização explícita**: toda conexão precisa ser aprovada por quem está no computador, que escolhe entre só ver ou permitir controle. A sessão ativa fica sempre visível e pode ser encerrada com um clique.
+- **Autorização explícita**: por padrão, toda conexão precisa ser aprovada por quem está no computador, que escolhe entre só ver ou permitir controle. A sessão ativa fica sempre visível e pode ser encerrada com um clique.
+- **Acesso não supervisionado** (opcional, desligado de fábrica): com uma senha definida de propósito, dá para entrar em um computador seu sem ninguém aprovar. A senha nunca trafega (SPAKE2), tentativas erradas são contadas e bloqueiam a porta, e tudo fica no histórico.
+- **Durante a sessão**: área de transferência de texto entre os dois computadores, troca entre os monitores do computador remoto, tela cheia, pausar o controle e bloquear o computador remoto.
 - **Cifragem de ponta a ponta**: QUIC com TLS 1.3 e identidade criptográfica por dispositivo. Não há servidor que possa ler a sessão.
 - Imagem sem perdas para texto e interface, JPEG para foto e vídeo, com refinamento automático quando a tela para.
 - **Computadores recentes** na tela inicial: um clique reconecta.
-- **Configurações** para uso pessoal e para empresas: nome e tema; abrir com o Windows; aceitar ou não pedidos de acesso; limitar quem acessa a "só ver"; bloquear o Windows ao fim do acesso; servidor de encontro e relay próprios; porta.
+- **Configurações** para uso pessoal e para empresas: nome e tema; abrir com o Windows; aceitar ou não pedidos de acesso; limitar quem acessa a "só ver"; bloquear o Windows ao fim do acesso; área de transferência; acesso não supervisionado; servidor de encontro e relay próprios; porta.
 - **Histórico de sessões** em arquivo (`history.jsonl`, uma linha JSON por evento), com as sessões feitas e recebidas e os pedidos recusados.
 - Um executável único, sem instalador.
 

@@ -7,6 +7,7 @@
 //!
 //! Tudo é texto legível, sem segredos: a chave do dispositivo fica à parte.
 
+use opendesk_session::auth::PasswordAccess;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -44,6 +45,11 @@ pub struct Settings {
     pub allow_control: bool,
     /// Bloqueia o sistema quando o último acesso a este computador termina.
     pub lock_on_end: bool,
+    /// Texto copiado atravessa a sessão (só em acessos com controle).
+    pub allow_clipboard: bool,
+    /// Acesso não supervisionado: quem souber a senha entra sem aprovação.
+    /// Só vale com uma senha salva (ver [`load_access`]).
+    pub unattended: bool,
     pub rendezvous: ServerChoice,
     pub rendezvous_url: String,
     /// `host:porta` de um relay; vazio para não usar.
@@ -60,6 +66,8 @@ impl Default for Settings {
             accept_incoming: true,
             allow_control: true,
             lock_on_end: false,
+            allow_clipboard: true,
+            unattended: false,
             rendezvous: ServerChoice::Default,
             rendezvous_url: String::new(),
             relay: String::new(),
@@ -125,6 +133,18 @@ pub fn short_when(when: &str) -> String {
         (Some(month), Some(day), Some(time)) => format!("{day}/{month} {time}"),
         _ => when.to_string(),
     }
+}
+
+/// A senha de acesso não supervisionado, na forma em que o host a guarda (sal
+/// e senha esticada; nunca a senha digitada). Fica num arquivo próprio, fora
+/// das configurações, porque quem o copia consegue entrar neste computador.
+pub fn load_access(dir: &Path) -> Option<PasswordAccess> {
+    let text = std::fs::read_to_string(dir.join("unattended.json")).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+pub fn save_access(dir: &Path, access: &PasswordAccess) -> io::Result<()> {
+    write_atomic(&dir.join("unattended.json"), &serde_json::to_string(access)?)
 }
 
 fn write_atomic(path: &Path, text: &str) -> io::Result<()> {
@@ -202,6 +222,8 @@ pub enum Kind {
     Refused,
     /// Pedido recusado sozinho, porque a entrada está desligada.
     Blocked,
+    /// Senha de acesso não supervisionado errada.
+    BadPassword,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -215,6 +237,9 @@ pub struct Entry {
     pub id: String,
     pub control: bool,
     pub seconds: u64,
+    /// A sessão foi liberada pela senha, sem ninguém aprovar.
+    #[serde(default)]
+    pub password: bool,
 }
 
 impl Entry {
@@ -223,9 +248,11 @@ impl Entry {
         match self.kind {
             Kind::Refused => "Recusado".into(),
             Kind::Blocked => "Bloqueado".into(),
+            Kind::BadPassword => "Senha errada".into(),
             Kind::Session => {
                 let mode = if self.control { "Controle" } else { "Só ver" };
-                format!("{mode}, {}", duration(self.seconds))
+                let how = if self.password { " por senha" } else { "" };
+                format!("{mode}{how}, {}", duration(self.seconds))
             }
         }
     }
@@ -330,6 +357,7 @@ mod tests {
             id: "602 758 973".into(),
             control: true,
             seconds,
+            password: false,
         };
         history.append(&entry("A", Kind::Session, 42));
         history.append(&entry("B", Kind::Refused, 0));
@@ -340,6 +368,28 @@ mod tests {
         assert_eq!(latest[0].summary(), "Controle, 1 h 05 min");
         assert_eq!(latest[1].summary(), "Recusado");
         assert_eq!(history.latest(10)[2].summary(), "Controle, 42 s");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn old_history_lines_still_load_and_password_sessions_say_so() {
+        // Linha gravada antes de existir o campo `password`.
+        let old = r#"{"when":"2026-11-12 22:41","incoming":true,"kind":"session","name":"A","id":"1","control":false,"seconds":90}"#;
+        let entry: Entry = serde_json::from_str(old).unwrap();
+        assert_eq!(entry.summary(), "Só ver, 1 min");
+        let by_password = Entry { password: true, control: true, ..entry };
+        assert_eq!(by_password.summary(), "Controle por senha, 1 min");
+    }
+
+    #[test]
+    fn password_access_round_trips_through_its_own_file() {
+        let dir = temp_dir("access");
+        assert!(load_access(&dir).is_none());
+        let access = PasswordAccess::create("uma senha bem comprida").unwrap();
+        save_access(&dir, &access).unwrap();
+        assert_eq!(load_access(&dir), Some(access));
+        let on_disk = std::fs::read_to_string(dir.join("unattended.json")).unwrap();
+        assert!(!on_disk.contains("comprida"), "a senha digitada não pode ir para o disco");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

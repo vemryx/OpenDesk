@@ -52,9 +52,29 @@ pub enum DenyReason {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Decision {
-    Granted { permissions: Permissions, display: DisplayDesc },
-    Denied { reason: DenyReason },
+    Granted {
+        permissions: Permissions,
+        display: DisplayDesc,
+        /// Qual dos monitores do host está sendo mostrado, e quantos há.
+        index: u8,
+        displays: u8,
+    },
+    Denied {
+        reason: DenyReason,
+    },
 }
+
+/// O que o visualizador precisa para tentar a senha de acesso não
+/// supervisionado: o sal e o custo da derivação da senha. Não revela nada
+/// sobre a senha em si.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PasswordChallenge {
+    pub salt: [u8; 16],
+    pub iterations: u32,
+}
+
+/// Maior texto de área de transferência que atravessa a sessão, em bytes.
+pub const MAX_CLIPBOARD_TEXT: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MouseButton {
@@ -100,6 +120,17 @@ pub enum ViewerMsg {
     /// Pede um quadro completo (por exemplo, após perder sincronia).
     RequestKeyframe,
     Bye,
+    /// Tentativa de entrar com a senha de acesso não supervisionado: a
+    /// mensagem do visualizador na troca SPAKE2. A senha nunca trafega.
+    Auth(Vec<u8>),
+    /// Prova de que o visualizador chegou à mesma chave que o host.
+    AuthConfirm([u8; 32]),
+    /// Texto copiado no computador de quem vê.
+    Clipboard(String),
+    /// Pede para ver outro monitor do host.
+    SelectDisplay(u8),
+    /// Pede para bloquear a estação do host (exige permissão de controle).
+    Lock,
 }
 
 /// Host → visualizador.
@@ -110,7 +141,25 @@ pub enum HostMsg {
         protocol: u16,
         device_name: String,
         app_version: String,
+        /// Presente se o host aceita senha de acesso não supervisionado.
+        password: Option<PasswordChallenge>,
     },
     Decision(Decision),
     Bye(String),
+    /// A mensagem do host na troca SPAKE2.
+    Auth(Vec<u8>),
+    /// A senha conferiu; prova de que o host também a conhece. A decisão
+    /// (`Decision::Granted`) vem em seguida.
+    AuthOk([u8; 32]),
+    /// A senha não conferiu. `retry` diz se dá para tentar de novo agora.
+    AuthFailed {
+        retry: bool,
+    },
+    /// Texto copiado no host.
+    Clipboard(String),
+    /// O monitor mostrado mudou.
+    Display {
+        index: u8,
+        display: DisplayDesc,
+    },
 }

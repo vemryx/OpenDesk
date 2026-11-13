@@ -19,8 +19,9 @@ use opendesk_net::{DeviceId, Fingerprint, Identity, Nat, Node, Presence};
 use opendesk_platform::keyboard::KeyboardGrab;
 use opendesk_proto::control::{InputEvent, MouseButton, Permissions};
 use opendesk_session::Wake;
-use opendesk_session::backend::SystemBackend;
-use opendesk_session::host::{Host, HostEvent, PeerInfo};
+use opendesk_session::auth::PasswordAccess;
+use opendesk_session::backend::{Clipboard as _, SystemBackend, SystemClipboard};
+use opendesk_session::host::{Host, HostEvent, PeerInfo, Unattended};
 use opendesk_session::viewer::{InputSender, Lookup, Route, Target, Viewer, ViewerEvent};
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -83,6 +84,12 @@ pub struct App {
     /// Um problema ao gravar ou aplicar configurações, mostrado na tela delas.
     settings_problem: Option<String>,
     net: settings::NetForm,
+    /// A senha de acesso não supervisionado, na forma guardada (ou nenhuma).
+    access: Option<PasswordAccess>,
+    /// Senha nova sendo digitada nas configurações.
+    new_password: String,
+    /// Resultado da última tentativa de salvar a senha: (deu certo, texto).
+    password_note: Option<(bool, String)>,
     /// Se o OpenDesk está registrado para abrir com o sistema.
     autostart: bool,
     recents: Recents,
@@ -109,6 +116,9 @@ pub struct App {
     copied_at: Option<Instant>,
     /// A janela foi maximizada pelo app ao entrar na sessão (e não pela pessoa).
     maximized_for_session: bool,
+    /// A sessão está em tela cheia; a barra só aparece com o ponteiro no topo.
+    fullscreen: bool,
+    bar_until: Option<Instant>,
     /// Em testes (`OPENDESK_WINDOW_POS`), a janela nunca toma o foco nem se maximiza.
     quiet: bool,
     #[cfg(debug_assertions)]
@@ -130,6 +140,16 @@ struct Inbound {
     peer: PeerInfo,
     permissions: Permissions,
     since: Instant,
+    /// Entrou pela senha de acesso não supervisionado.
+    by_password: bool,
+}
+
+/// Como está a tentativa de entrar com a senha do computador remoto.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PasswordTry {
+    Idle,
+    Checking,
+    Wrong { retry: bool },
 }
 
 enum Stage {
@@ -149,6 +169,19 @@ struct Outgoing {
     stage: Stage,
     /// Quando a sessão foi autorizada, para o histórico.
     live_since: Option<Instant>,
+    /// O host aceita senha de acesso não supervisionado.
+    accepts_password: bool,
+    password: String,
+    password_try: PasswordTry,
+    /// Liberada pela senha (para o histórico).
+    by_password: bool,
+    /// Qual monitor do host está na tela, e quantos ele tem.
+    display_index: u8,
+    displays: u8,
+    /// Mouse e teclado não são enviados enquanto pausado.
+    paused: bool,
+    /// Presente quando a sessão sincroniza a área de transferência.
+    clipboard: Option<SystemClipboard>,
     texture: Option<TextureHandle>,
     epoch: u64,
     size: [usize; 2],
@@ -244,6 +277,9 @@ impl App {
             ctx: cc.egui_ctx.clone(),
             logo: theme::Logo::load(),
             net: settings::NetForm::of(&settings),
+            access: crate::config::load_access(&data_dir),
+            new_password: String::new(),
+            password_note: None,
             settings,
             settings_problem: None,
             autostart: opendesk_platform::system::autostart_command().is_some(),
@@ -266,6 +302,8 @@ impl App {
             notice: None,
             copied_at: None,
             maximized_for_session: false,
+            fullscreen: false,
+            bar_until: None,
             quiet: std::env::var_os("OPENDESK_WINDOW_POS").is_some(),
             #[cfg(debug_assertions)]
             preview_details: Default::default(),
@@ -273,6 +311,7 @@ impl App {
             key_target,
         };
         app.start_presence();
+        app.apply_host_policy();
         #[cfg(debug_assertions)]
         app.preview();
         // `--minimized` é como o Windows abre o app junto com o sistema.
@@ -313,10 +352,46 @@ impl App {
         }));
     }
 
+    /// O acesso não supervisionado está de fato valendo: ligado, com senha
+    /// salva e com a entrada aceita.
+    fn unattended_active(&self) -> bool {
+        self.settings.accept_incoming && self.settings.unattended && self.access.is_some()
+    }
+
+    /// O máximo que uma sessão de entrada pode receber, pelas configurações.
+    fn most_permissions(&self) -> Permissions {
+        let control = self.settings.allow_control;
+        Permissions { control, clipboard: control && self.settings.allow_clipboard }
+    }
+
+    /// Passa ao host a política de acesso não supervisionado em vigor.
+    fn apply_host_policy(&self) {
+        let policy = self
+            .access
+            .clone()
+            .filter(|_| self.unattended_active())
+            .map(|access| Unattended { access, permissions: self.most_permissions() });
+        self.host.set_unattended(policy);
+    }
+
     /// Acrescenta um evento ao histórico de sessões.
     fn log(&mut self, incoming: bool, kind: Kind, name: &str, id: String, control: bool, seconds: u64) {
+        self.log_how(incoming, kind, name, id, control, seconds, false);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn log_how(
+        &mut self,
+        incoming: bool,
+        kind: Kind,
+        name: &str,
+        id: String,
+        control: bool,
+        seconds: u64,
+        password: bool,
+    ) {
         let when = opendesk_platform::system::local_time();
-        let entry = Entry { when, incoming, kind, name: name.to_string(), id, control, seconds };
+        let entry = Entry { when, incoming, kind, name: name.to_string(), id, control, seconds, password };
         self.history.append(&entry);
         self.history_view.insert(0, entry);
         self.history_view.truncate(200);
@@ -351,6 +426,7 @@ impl App {
                     peer: peer(),
                     permissions: Permissions::FULL,
                     since: Instant::now(),
+                    by_password: false,
                 }),
                 "aviso" => {
                     self.notice =
@@ -378,6 +454,7 @@ impl App {
                         id: "602 758 973".into(),
                         control,
                         seconds,
+                        password: false,
                     };
                     self.history_view = vec![
                         entry(false, Kind::Session, "NOTEBOOK-ANA", true, 1_260),
@@ -441,6 +518,14 @@ impl App {
             route: None,
             stage: Stage::Connecting,
             live_since: None,
+            accepts_password: false,
+            password: String::new(),
+            password_try: PasswordTry::Idle,
+            by_password: false,
+            display_index: 0,
+            displays: 1,
+            paused: false,
+            clipboard: None,
             texture: None,
             epoch: 0,
             size: [0, 0],
@@ -458,7 +543,11 @@ impl App {
             && let (Stage::Live { permissions }, Some(since)) = (&out.stage, out.live_since)
         {
             let id = out.fingerprint.map_or_else(|| out.target.clone(), |f| f.device_id().to_string());
-            self.log(false, Kind::Session, &out.host_name, id, permissions.control, since.elapsed().as_secs());
+            let seconds = since.elapsed().as_secs();
+            self.log_how(false, Kind::Session, &out.host_name, id, permissions.control, seconds, out.by_password);
+        }
+        if std::mem::take(&mut self.fullscreen) {
+            self.ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         }
         self.notice = notice;
         // Fim da sessão: a janela volta ao tamanho compacto da tela inicial.
@@ -485,8 +574,14 @@ impl App {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     }
                 }
-                HostEvent::Started { session, peer, permissions } => {
-                    self.inbound.push(Inbound { session, peer, permissions, since: Instant::now() });
+                HostEvent::Started { session, peer, permissions, by_password } => {
+                    // Se entrou pela senha, o pedido que estava na tela some.
+                    self.requests.retain(|r| r.session != session);
+                    self.inbound.push(Inbound { session, peer, permissions, since: Instant::now(), by_password });
+                }
+                HostEvent::PasswordFailed { peer, .. } => {
+                    let id = peer.fingerprint.device_id().to_string();
+                    self.log(true, Kind::BadPassword, &peer.name, id, false, 0);
                 }
                 HostEvent::Ended { session, .. } => {
                     self.requests.retain(|r| r.session != session);
@@ -494,7 +589,8 @@ impl App {
                         let ended = self.inbound.remove(index);
                         let id = ended.peer.fingerprint.device_id().to_string();
                         let seconds = ended.since.elapsed().as_secs();
-                        self.log(true, Kind::Session, &ended.peer.name, id, ended.permissions.control, seconds);
+                        let (control, password) = (ended.permissions.control, ended.by_password);
+                        self.log_how(true, Kind::Session, &ended.peer.name, id, control, seconds, password);
                         if self.inbound.is_empty() && self.settings.lock_on_end && !self.quiet {
                             opendesk_platform::system::lock_workstation();
                         }
@@ -508,25 +604,43 @@ impl App {
         if let Some(out) = &mut self.outgoing {
             while let Ok(event) = out.events.try_recv() {
                 match event {
-                    ViewerEvent::Connected { host_name, fingerprint, route } => {
+                    ViewerEvent::Connected { host_name, fingerprint, route, password } => {
+                        out.accepts_password = password;
                         out.host_name = host_name;
                         out.fingerprint = Some(fingerprint);
                         out.route = Some(route);
                         out.stage = Stage::Waiting;
                     }
-                    ViewerEvent::Granted { permissions, .. } => {
+                    ViewerEvent::Granted { permissions, index, displays, .. } => {
                         out.stage = Stage::Live { permissions };
                         out.live_since = Some(Instant::now());
+                        // A senha foi aceita se era ela que estava em conferência.
+                        out.by_password = out.password_try == PasswordTry::Checking;
+                        (out.display_index, out.displays) = (index, displays);
+                        out.clipboard = permissions.clipboard.then(SystemClipboard::new);
                         self.recents.touch(&out.target, &out.host_name, opendesk_platform::system::local_time());
                         granted = true;
                         if permissions.control {
                             *self.key_target.lock().unwrap() = Some(out.viewer.input_sender());
                         }
                     }
+                    ViewerEvent::PasswordRejected { retry } => out.password_try = PasswordTry::Wrong { retry },
+                    ViewerEvent::Clipboard(text) => {
+                        if let Some(clipboard) = &mut out.clipboard {
+                            clipboard.set(&text);
+                        }
+                    }
+                    ViewerEvent::Display { index, .. } => out.display_index = index,
                     ViewerEvent::Denied(_) => {}
                     ViewerEvent::Closed(reason) => closed = Some(reason),
                 }
             }
+        }
+        // O que foi copiado aqui vai para o computador remoto.
+        if let Some(out) = &mut self.outgoing
+            && let Some(text) = out.clipboard.as_mut().and_then(|clipboard| clipboard.poll())
+        {
+            out.viewer.send_clipboard(text);
         }
         // A tela remota precisa de espaço: a sessão abre com a janela maximizada.
         let large = ctx.input(|i| i.viewport().maximized == Some(true) || i.viewport().fullscreen == Some(true));
@@ -541,7 +655,7 @@ impl App {
         // O teclado só é desviado para o remoto com a sessão em foco e com
         // permissão de controle.
         if let Some(grab) = &self.keyboard {
-            let controlling = matches!(&self.outgoing, Some(Outgoing { stage: Stage::Live { permissions }, .. }) if permissions.control);
+            let controlling = matches!(&self.outgoing, Some(Outgoing { stage: Stage::Live { permissions }, paused: false, .. }) if permissions.control);
             grab.set_active(controlling && ctx.input(|i| i.focused));
         }
 
@@ -635,7 +749,9 @@ impl App {
             self.copied_at = Some(Instant::now());
         }
         ui.add_space(4.0);
-        let hint = if self.settings.accept_incoming {
+        let hint = if self.unattended_active() {
+            format!("Passe {what} para quem vai acessar. Quem tiver a senha de acesso entra sem a sua aprovação.")
+        } else if self.settings.accept_incoming {
             format!("Passe {what} para quem vai acessar. Você aprova cada conexão.")
         } else {
             "Este computador não está aceitando pedidos de acesso. Isso muda em Configurações, Segurança.".to_string()
@@ -747,7 +863,7 @@ impl App {
         ui.add_space(2.0);
         ui.add_enabled(!busy, egui::Checkbox::new(&mut self.want_control, "Controlar mouse e teclado"));
 
-        if let Some(out) = &self.outgoing {
+        if let Some(out) = &mut self.outgoing {
             let status = match out.stage {
                 Stage::Connecting if out.by_id => format!("Procurando {}…", out.target),
                 Stage::Connecting => format!("Conectando a {}…", out.target),
@@ -767,6 +883,9 @@ impl App {
                     )
                     .small(),
                 );
+            }
+            if out.accepts_password && matches!(out.stage, Stage::Waiting) {
+                out.password_form(ui, p);
             }
         }
         if let Some(notice) = &self.notice {
@@ -862,9 +981,10 @@ impl App {
                     ui.horizontal(|ui| {
                         theme::dot(ui, p.alert_text);
                         let verb = if session.permissions.control { "está controlando" } else { "está vendo" };
+                        let how = if session.by_password { ", pela senha de acesso" } else { "" };
                         let secs = session.since.elapsed().as_secs();
                         ui.label(
-                            RichText::new(format!("{} {verb} este computador", session.peer.name))
+                            RichText::new(format!("{} {verb} este computador{how}", session.peer.name))
                                 .font(theme::semibold(13.5))
                                 .color(p.alert_text),
                         );
@@ -887,6 +1007,7 @@ impl App {
         let peer = &request.peer;
         let remaining = REQUEST_TTL.saturating_sub(request.since.elapsed()).as_secs();
         let mut answer: Option<Option<Permissions>> = None;
+        let full = self.most_permissions();
         // Com o controle desligado nas configurações, só dá para deixar ver.
         let may_control = peer.wants.control && self.settings.allow_control;
 
@@ -935,7 +1056,7 @@ impl App {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if may_control {
                         if theme::primary_button(ui, p, "Permitir controle", true, 0.0).clicked() {
-                            answer = Some(Some(Permissions::FULL));
+                            answer = Some(Some(full));
                         }
                         if ui.button("Somente ver").clicked() {
                             answer = Some(Some(Permissions::VIEW_ONLY));
@@ -965,8 +1086,22 @@ impl App {
         let Some(out) = &mut self.outgoing else { return };
         let Stage::Live { permissions } = out.stage else { return };
         out.stats.sample(&out.viewer);
-        let mut end = false;
-        egui::Panel::top("session-bar")
+
+        // Em tela cheia a barra sai do caminho e volta quando o ponteiro
+        // encosta no topo (ou enquanto um menu dela está aberto).
+        if self.fullscreen {
+            let at_top = ui.ctx().input(|i| i.pointer.hover_pos().is_some_and(|pos| pos.y < 6.0));
+            if at_top || egui::Popup::is_any_open(ui.ctx()) {
+                self.bar_until = Some(Instant::now() + Duration::from_millis(1500));
+            }
+            if self.bar_until.is_none_or(|until| Instant::now() >= until) {
+                return;
+            }
+        }
+
+        let (mut end, mut toggle_fullscreen) = (false, false);
+        let fullscreen = self.fullscreen;
+        let bar = egui::Panel::top("session-bar")
             .frame(egui::Frame::new().fill(p.side).inner_margin(Margin::symmetric(14, 6)))
             .show_separator_line(false)
             .show(ui, |ui| {
@@ -991,11 +1126,45 @@ impl App {
                         ui.label(theme::muted(format!("{}{latency}", route.label()), p).small())
                             .on_hover_text(explanation);
                     }
+                    if let Some(since) = out.live_since {
+                        let secs = since.elapsed().as_secs();
+                        let clock = match secs / 3600 {
+                            0 => format!("{:02}:{:02}", secs / 60, secs % 60),
+                            hours => format!("{hours}:{:02}:{:02}", secs % 3600 / 60, secs % 60),
+                        };
+                        ui.label(theme::muted(clock, p).small()).on_hover_text("Duração da sessão");
+                    }
+
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.button("Encerrar").clicked() {
                             end = true;
                         }
-                        let mode = if permissions.control { "Controle ativo" } else { "Somente visualização" };
+                        if permissions.control {
+                            ui.menu_button("Ações", |ui| {
+                                let pause = if out.paused { "Retomar o controle" } else { "Pausar o controle" };
+                                if ui.button(pause).clicked() {
+                                    out.paused = !out.paused;
+                                    ui.close();
+                                }
+                                if ui.button("Bloquear o computador remoto").clicked() {
+                                    out.viewer.lock_remote();
+                                    ui.close();
+                                }
+                            });
+                        }
+                        let label = if fullscreen { "Sair da tela cheia" } else { "Tela cheia" };
+                        toggle_fullscreen = ui.button(label).clicked();
+                        if out.displays > 1 {
+                            let label = format!("Monitor {} de {}", out.display_index + 1, out.displays);
+                            if ui.button(label).on_hover_text("Mostrar o próximo monitor").clicked() {
+                                out.viewer.select_display((out.display_index + 1) % out.displays);
+                            }
+                        }
+                        let mode = match (permissions.control, out.paused) {
+                            (true, false) => "Controle ativo",
+                            (true, true) => "Controle pausado",
+                            (false, _) => "Somente visualização",
+                        };
                         ui.label(theme::muted(mode, p).small());
                         ui.add_space(8.0);
                         // Transparência sem ruído: o essencial na barra, o resto no ponteiro.
@@ -1007,6 +1176,15 @@ impl App {
                     });
                 });
             });
+        // Com o ponteiro na barra, ela fica.
+        if self.fullscreen && bar.response.contains_pointer() {
+            self.bar_until = Some(Instant::now() + Duration::from_millis(1500));
+        }
+        if toggle_fullscreen {
+            self.fullscreen = !self.fullscreen;
+            self.bar_until = Some(Instant::now() + Duration::from_millis(1500));
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        }
         if end {
             self.end_outgoing(None);
         }
@@ -1029,7 +1207,7 @@ impl App {
             let image = Rect::from_center_size(area.center(), Vec2::new(width as f32, height as f32) * scale);
             let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
             ui.painter().image(texture.id(), image, uv, Color32::WHITE);
-            if permissions.control {
+            if permissions.control && !out.paused {
                 out.forward_pointer(ui, image);
             }
         });
@@ -1037,6 +1215,52 @@ impl App {
 }
 
 impl Outgoing {
+    /// Entrar com a senha de acesso não supervisionado, enquanto o pedido
+    /// aguarda alguém aprovar do outro lado.
+    fn password_form(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        ui.add_space(10.0);
+        let label = ui.label(theme::muted("Ou entre com a senha de acesso desse computador:", p).small());
+        let locked = self.password_try == PasswordTry::Wrong { retry: false };
+        let checking = self.password_try == PasswordTry::Checking;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().interact_size.y = 32.0;
+            let field = ui
+                .add_enabled(
+                    !locked && !checking,
+                    egui::TextEdit::singleline(&mut self.password)
+                        .password(true)
+                        .hint_text("Senha de acesso")
+                        .margin(Margin::symmetric(10, 7))
+                        .desired_width(220.0),
+                )
+                .labelled_by(label.id);
+            let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let ready = !self.password.is_empty() && !locked && !checking;
+            if (theme::primary_button(ui, p, "Entrar", ready, 84.0).clicked() || entered) && ready {
+                self.viewer.submit_password(std::mem::take(&mut self.password));
+                self.password_try = PasswordTry::Checking;
+            }
+        });
+        match self.password_try {
+            PasswordTry::Idle => {}
+            PasswordTry::Checking => {
+                ui.label(theme::muted("Conferindo a senha…", p).small());
+            }
+            PasswordTry::Wrong { retry: true } => {
+                ui.label(RichText::new("Senha incorreta.").small().color(p.danger));
+            }
+            PasswordTry::Wrong { retry: false } => {
+                ui.label(
+                    RichText::new(
+                        "Senha incorreta. Esse computador não aceita novas tentativas por enquanto; o pedido continua valendo se alguém aprovar lá.",
+                    )
+                    .small()
+                    .color(p.danger),
+                );
+            }
+        }
+    }
+
     /// Copia para a textura só a região que mudou desde o último quadro
     /// desenhado.
     fn sync_texture(&mut self, ctx: &egui::Context) {

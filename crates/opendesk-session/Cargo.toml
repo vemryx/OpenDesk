@@ -14,4 +14,7 @@ opendesk-platform.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 quinn.workspace = true
+ring.workspace = true
+spake2.workspace = true
+serde.workspace = true
 tracing.workspace = true

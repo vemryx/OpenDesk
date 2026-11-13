@@ -86,3 +86,19 @@ pub mod system {
         format!("{year:04}-{month:02}-{day:02} {:02}:{:02} UTC", rest / 3_600, rest % 3_600 / 60)
     }
 }
+
+pub mod clipboard {
+    use anyhow::{Result, bail};
+
+    pub fn sequence() -> u32 {
+        0
+    }
+
+    pub fn text() -> Option<String> {
+        None
+    }
+
+    pub fn set_text(_text: &str) -> Result<()> {
+        bail!(super::MSG)
+    }
+}

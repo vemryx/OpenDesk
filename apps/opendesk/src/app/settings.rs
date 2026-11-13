@@ -170,13 +170,61 @@ impl App {
                     theme::toggle(ui, p, &mut settings.lock_on_end, "Bloquear o Windows ao fim do acesso").changed();
             },
         );
-        ui.label(
-            theme::muted(
-                "Todo acesso a este computador precisa ser aprovado aqui, por quem está na frente dele. Acesso sem ninguém para aprovar ainda não existe no OpenDesk.",
-                p,
-            )
-            .small(),
+        theme::setting(
+            ui,
+            p,
+            "Sincronizar a área de transferência",
+            "Durante um acesso com controle, o texto copiado em um computador pode ser colado no outro.",
+            |ui| {
+                changed |= theme::toggle(ui, p, &mut settings.allow_clipboard, "Sincronizar a área de transferência")
+                    .changed();
+            },
         );
+        theme::setting(
+            ui,
+            p,
+            "Acesso não supervisionado",
+            "Quem souber a senha de acesso entra neste computador sem ninguém aprovar. Ligue só em computadores seus, com uma senha longa que você não usa em nenhum outro lugar.",
+            |ui| changed |= theme::toggle(ui, p, &mut settings.unattended, "Acesso não supervisionado").changed(),
+        );
+        let mut save = false;
+        if settings.unattended {
+            let (title, help) = if self.access.is_some() {
+                (
+                    "Trocar a senha de acesso",
+                    "Já há uma senha salva. Ela não pode ser lida de volta; para trocar, digite uma nova.",
+                )
+            } else {
+                ("Senha de acesso", "Pelo menos 8 caracteres. O acesso só passa a valer depois de salvar a senha.")
+            };
+            let long_enough = self.new_password.chars().count() >= opendesk_session::auth::MIN_PASSWORD_LEN;
+            theme::setting(ui, p, title, help, |ui| {
+                save = ui.add_enabled(long_enough, egui::Button::new("Salvar")).clicked();
+                let field = egui::TextEdit::singleline(&mut self.new_password)
+                    .password(true)
+                    .hint_text("Nova senha")
+                    .desired_width(200.0);
+                let typed = ui.add(field);
+                save |= long_enough && typed.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if typed.changed() {
+                    self.password_note = None;
+                }
+            });
+            if let Some((ok, text)) = &self.password_note {
+                ui.label(RichText::new(text).small().color(if *ok { p.muted } else { p.danger }));
+            }
+        } else {
+            ui.label(
+                theme::muted(
+                    "Com o acesso não supervisionado desligado, todo acesso precisa ser aprovado aqui, por quem está na frente do computador.",
+                    p,
+                )
+                .small(),
+            );
+        }
+        if save {
+            self.save_password();
+        }
         if changed {
             self.settings_changed();
         }
@@ -338,6 +386,26 @@ impl App {
         }
     }
 
+    /// Define a senha de acesso não supervisionado. Só a forma derivada vai
+    /// para o disco; o que foi digitado sai da memória da tela.
+    fn save_password(&mut self) {
+        let password = std::mem::take(&mut self.new_password);
+        let saved = opendesk_session::auth::PasswordAccess::create(&password)
+            .and_then(|access| Ok(config::save_access(&self.data_dir, &access).map(|()| access)?));
+        self.password_note = Some(match saved {
+            Ok(access) => {
+                self.access = Some(access);
+                self.apply_host_policy();
+                if self.settings.accept_incoming {
+                    (true, "Senha salva. O acesso não supervisionado está valendo.".into())
+                } else {
+                    (true, "Senha salva. Ela passa a valer quando \"Aceitar pedidos de acesso\" estiver ligado.".into())
+                }
+            }
+            Err(err) => (false, format!("Não foi possível salvar a senha: {err:#}.")),
+        });
+    }
+
     /// Grava as configurações e aplica o que tem efeito imediato.
     fn settings_changed(&mut self) {
         self.settings_problem = self
@@ -355,6 +423,7 @@ impl App {
             self.host.set_device_name(name.clone());
             self.device_name = name;
         }
+        self.apply_host_policy();
     }
 
     fn set_autostart(&mut self, on: bool) {

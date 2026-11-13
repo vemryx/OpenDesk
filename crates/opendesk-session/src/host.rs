@@ -1,3 +1,4 @@
+use crate::auth::{HostExchange, MAX_FAILURES_PER_CONNECTION, PasswordAccess, Throttle};
 use crate::backend::Backend;
 use crate::{Wake, describe_close};
 use anyhow::{Context, Result, anyhow, bail};
@@ -5,13 +6,13 @@ use opendesk_codec::{Encoder, EncoderConfig, FrameRef};
 use opendesk_net::{Fingerprint, Node, PeerConn};
 use opendesk_platform::capture::DisplayInfo;
 use opendesk_proto::PROTOCOL_VERSION;
-use opendesk_proto::control::{Decision, DenyReason, DisplayDesc, HostMsg, Permissions, ViewerMsg};
-use opendesk_proto::wire::{recv_msg, send_msg, write_frame};
+use opendesk_proto::control::{Decision, DenyReason, DisplayDesc, HostMsg, MAX_CLIPBOARD_TEXT, Permissions, ViewerMsg};
+use opendesk_proto::wire::{send_msg, write_frame};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
@@ -20,6 +21,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Espera máxima por mudança na tela antes de aproveitar para refinar.
 const CAPTURE_POLL_MS: u32 = 40;
+/// De quanto em quanto tempo o host olha se algo novo foi copiado.
+const CLIPBOARD_POLL: Duration = Duration::from_millis(400);
 
 /// Quem está pedindo acesso.
 #[derive(Debug, Clone)]
@@ -35,21 +38,26 @@ pub struct PeerInfo {
 pub enum HostEvent {
     /// Alguém quer conectar. Responda com `Some(permissões)` para autorizar
     /// ou `None` para recusar; descartar o `reply` também recusa.
-    Request {
-        session: u64,
-        peer: PeerInfo,
-        reply: oneshot::Sender<Option<Permissions>>,
-    },
+    Request { session: u64, peer: PeerInfo, reply: oneshot::Sender<Option<Permissions>> },
     Started {
         session: u64,
         peer: PeerInfo,
         permissions: Permissions,
+        /// A sessão foi liberada pela senha de acesso não supervisionado, e
+        /// não por alguém neste computador.
+        by_password: bool,
     },
+    /// Alguém errou a senha de acesso não supervisionado.
+    PasswordFailed { session: u64, peer: PeerInfo },
     /// Enviado para todo `Request`, tenha a sessão começado ou não.
-    Ended {
-        session: u64,
-        reason: String,
-    },
+    Ended { session: u64, reason: String },
+}
+
+/// Acesso não supervisionado: a senha e o que ela libera.
+#[derive(Debug, Clone)]
+pub struct Unattended {
+    pub access: PasswordAccess,
+    pub permissions: Permissions,
 }
 
 pub struct Host {
@@ -64,6 +72,9 @@ pub struct Host {
     /// por processo, então por enquanto o host atende um visualizador por
     /// vez; vários ao mesmo tempo exigem compartilhar a captura (roteiro).
     streaming: Arc<AtomicBool>,
+    /// `None` (o padrão): toda sessão depende de alguém aprovar aqui.
+    unattended: Mutex<Option<Unattended>>,
+    throttle: Mutex<Throttle>,
 }
 
 impl Host {
@@ -83,6 +94,8 @@ impl Host {
             connections: Mutex::new(HashMap::new()),
             next_session: AtomicU64::new(1),
             streaming: Arc::new(AtomicBool::new(false)),
+            unattended: Mutex::new(None),
+            throttle: Mutex::new(Throttle::default()),
         };
         (Arc::new(host), receiver)
     }
@@ -115,12 +128,18 @@ impl Host {
         }
     }
 
-    /// Encerra uma sessão (ou cancela um pedido pendente).
     /// Troca o nome com que este computador se apresenta nas próximas sessões.
     pub fn set_device_name(&self, name: String) {
         *self.device_name.lock().unwrap() = name;
     }
 
+    /// Liga (com `Some`) ou desliga o acesso não supervisionado. Vale para os
+    /// próximos pedidos; sessões em andamento não mudam.
+    pub fn set_unattended(&self, unattended: Option<Unattended>) {
+        *self.unattended.lock().unwrap() = unattended;
+    }
+
+    /// Encerra uma sessão (ou cancela um pedido pendente).
     pub fn disconnect(&self, session: u64) {
         if let Some(conn) = self.connections.lock().unwrap().get(&session) {
             conn.close(0u32.into(), b"host");
@@ -140,22 +159,25 @@ impl Host {
 
     async fn run(&self, session: u64, peer: &PeerConn, announced: &mut bool) -> Result<String> {
         let conn = &peer.conn;
-        let (mut tx, mut rx) = timeout(HANDSHAKE_TIMEOUT, conn.accept_bi())
+        let (mut tx, rx) = timeout(HANDSHAKE_TIMEOUT, conn.accept_bi())
             .await
             .map_err(|_| anyhow!("o visualizador não abriu o canal de controle"))??;
-        let hello = match timeout(HANDSHAKE_TIMEOUT, recv_msg::<_, ViewerMsg>(&mut rx)).await {
-            Ok(Ok(ViewerMsg::Hello(hello))) => hello,
-            Ok(Ok(_)) => bail!("o visualizador não se apresentou"),
-            Ok(Err(err)) => return Err(err).context("ler apresentação"),
+        let mut inbox = crate::inbox::<ViewerMsg>(rx);
+        let hello = match timeout(HANDSHAKE_TIMEOUT, inbox.recv()).await {
+            Ok(Some(ViewerMsg::Hello(hello))) => hello,
+            Ok(Some(_)) => bail!("o visualizador não se apresentou"),
+            Ok(None) => bail!("o canal de controle fechou antes da apresentação"),
             Err(_) => bail!("o visualizador não se apresentou a tempo"),
         };
         let device_name = self.device_name.lock().unwrap().clone();
+        let unattended = self.unattended.lock().unwrap().clone();
         send_msg(
             &mut tx,
             &HostMsg::Welcome {
                 protocol: PROTOCOL_VERSION,
                 device_name,
                 app_version: env!("CARGO_PKG_VERSION").into(),
+                password: unattended.as_ref().map(|unattended| unattended.access.challenge()),
             },
         )
         .await?;
@@ -182,23 +204,76 @@ impl Host {
             wants: hello.wants,
         };
 
-        // A decisão é sempre de quem está no computador.
-        let (reply, answer) = oneshot::channel();
+        // Dois caminhos levam a uma sessão, e só eles: alguém neste computador
+        // aprova o pedido, ou o visualizador prova que sabe a senha de acesso
+        // não supervisionado (se ela estiver ligada). O pedido aparece na tela
+        // nos dois casos.
+        let (reply, mut answer) = oneshot::channel();
         *announced = true;
         self.emit(HostEvent::Request { session, peer: info.clone(), reply });
-        let granted = tokio::select! {
-            answer = timeout(APPROVAL_TIMEOUT, answer) => match answer {
-                Ok(Ok(Some(permissions))) => permissions.intersect(hello.wants),
-                Ok(_) => {
-                    deny(&mut tx, conn, DenyReason::Rejected).await;
-                    return Ok("Pedido recusado.".into());
-                }
-                Err(_) => {
+        let deadline = tokio::time::sleep(APPROVAL_TIMEOUT);
+        tokio::pin!(deadline);
+        let mut exchange: Option<HostExchange> = None;
+        let mut failures = 0;
+        let (granted, by_password) = loop {
+            tokio::select! {
+                answer = &mut answer => match answer {
+                    Ok(Some(permissions)) => break (permissions.intersect(hello.wants), false),
+                    _ => {
+                        deny(&mut tx, conn, DenyReason::Rejected).await;
+                        return Ok("Pedido recusado.".into());
+                    }
+                },
+                _ = &mut deadline => {
                     deny(&mut tx, conn, DenyReason::Timeout).await;
                     return Ok("Pedido expirou sem resposta.".into());
                 }
-            },
-            closed = conn.closed() => return Ok(describe_close(&closed)),
+                closed = conn.closed() => return Ok(describe_close(&closed)),
+                msg = inbox.recv() => match msg {
+                    Some(ViewerMsg::Auth(message)) => {
+                        let open = failures < MAX_FAILURES_PER_CONNECTION
+                            && !self.throttle.lock().unwrap().locked(Instant::now());
+                        let started = match &unattended {
+                            Some(unattended) if open => {
+                                let me = self.node.identity().fingerprint();
+                                HostExchange::respond(&unattended.access, peer.fingerprint, me, &message).ok()
+                            }
+                            _ => None,
+                        };
+                        match started {
+                            Some((state, reply)) => {
+                                exchange = Some(state);
+                                send_msg(&mut tx, &HostMsg::Auth(reply)).await?;
+                            }
+                            // Senha desligada, tentativas esgotadas ou mensagem inválida.
+                            None => send_msg(&mut tx, &HostMsg::AuthFailed { retry: false }).await?,
+                        }
+                    }
+                    Some(ViewerMsg::AuthConfirm(tag)) => {
+                        let (Some(state), Some(unattended)) = (exchange.take(), &unattended) else { continue };
+                        if let Some(proof) = state.check(&tag) {
+                            send_msg(&mut tx, &HostMsg::AuthOk(proof)).await?;
+                            break (unattended.permissions.intersect(hello.wants), true);
+                        }
+                        failures += 1;
+                        let retry = {
+                            let mut throttle = self.throttle.lock().unwrap();
+                            throttle.record_failure(Instant::now());
+                            failures < MAX_FAILURES_PER_CONNECTION && !throttle.locked(Instant::now())
+                        };
+                        self.emit(HostEvent::PasswordFailed { session, peer: info.clone() });
+                        send_msg(&mut tx, &HostMsg::AuthFailed { retry }).await?;
+                    }
+                    Some(ViewerMsg::Bye) => return Ok("O visualizador desistiu do pedido.".into()),
+                    Some(_) => {}
+                    None => {
+                        return Ok(match conn.close_reason() {
+                            Some(closed) => describe_close(&closed),
+                            None => "O canal de controle foi fechado.".into(),
+                        });
+                    }
+                },
+            }
         };
 
         // Dois pedidos aprovados ao mesmo tempo: só o primeiro leva.
@@ -209,20 +284,17 @@ impl Host {
         let _free_on_exit = ClearOnDrop(self.streaming.clone());
 
         // Sobe a captura antes de responder, para já informar a resolução.
-        let stop = Arc::new(AtomicBool::new(false));
-        let keyframe = Arc::new(AtomicBool::new(false));
-        let (packets_tx, mut packets) = mpsc::channel::<Vec<u8>>(1);
-        let (ready_tx, ready) = oneshot::channel::<Result<DisplayInfo>>();
-        let _stop_on_exit = StopOnDrop(stop.clone());
-        spawn_capture(self.backend.clone(), stop.clone(), keyframe.clone(), packets_tx, ready_tx)?;
-        let display = match timeout(HANDSHAKE_TIMEOUT, ready).await {
-            Ok(Ok(Ok(display))) => display,
-            other => {
+        let displays = self.backend.displays().clamp(1, u8::MAX as usize);
+        let mut index = self.backend.default_display().min(displays - 1);
+        // Cada troca de monitor começa uma geração nova de quadros; os da
+        // geração anterior que ainda estiverem a caminho são descartados.
+        let generation = Arc::new(AtomicU64::new(0));
+        let (packets_tx, mut packets) = mpsc::channel::<Captured>(1);
+        let (mut capture, display) = match start_capture(self.backend.clone(), index, 0, packets_tx.clone()).await {
+            Ok(started) => started,
+            Err(err) => {
                 deny(&mut tx, conn, DenyReason::CaptureUnavailable).await;
-                return match other {
-                    Ok(Ok(Err(err))) => Err(err.context("iniciar captura de tela")),
-                    _ => Err(anyhow!("a captura de tela não iniciou")),
-                };
+                return Err(err.context("iniciar captura de tela"));
             }
         };
 
@@ -230,40 +302,86 @@ impl Host {
             &mut tx,
             &HostMsg::Decision(Decision::Granted {
                 permissions: granted,
-                display: DisplayDesc {
-                    width: display.width as u16,
-                    height: display.height as u16,
-                    name: display.name.clone(),
-                },
+                display: describe(&display),
+                index: index as u8,
+                displays: displays as u8,
             }),
         )
         .await?;
-        self.emit(HostEvent::Started { session, peer: info, permissions: granted });
+        self.emit(HostEvent::Started { session, peer: info, permissions: granted, by_password });
 
         let mut sink = self.backend.open_sink(&display);
+        let mut clipboard = if granted.clipboard { self.backend.open_clipboard() } else { None };
+        let current = generation.clone();
         let video = async {
             let mut stream = conn.open_uni().await.context("abrir canal de vídeo")?;
-            while let Some(packet) = packets.recv().await {
-                write_frame(&mut stream, &packet).await.context("enviar quadro")?;
+            while let Some(captured) = packets.recv().await {
+                match captured {
+                    Captured::Frame(of, packet) if of == current.load(Ordering::Acquire) => {
+                        write_frame(&mut stream, &packet).await.context("enviar quadro")?;
+                    }
+                    Captured::Stopped(of) if of == current.load(Ordering::Acquire) => break,
+                    Captured::Frame(..) | Captured::Stopped(_) => {}
+                }
             }
             anyhow::Ok("A captura de tela parou.".to_string())
         };
         let control = async {
+            let mut clipboard_tick = tokio::time::interval(CLIPBOARD_POLL);
             loop {
-                match recv_msg::<_, ViewerMsg>(&mut rx).await {
-                    // A permissão é conferida aqui, no host: um visualizador
-                    // modificado não ganha controle só por mandar eventos.
-                    Ok(ViewerMsg::Input(event)) if granted.control => sink.apply(event),
-                    Ok(ViewerMsg::Input(_)) | Ok(ViewerMsg::Hello(_)) => {}
-                    Ok(ViewerMsg::RequestKeyframe) => keyframe.store(true, Ordering::Relaxed),
-                    Ok(ViewerMsg::Bye) => return "O visualizador encerrou a sessão.".to_string(),
-                    // A leitura falha no mesmo instante em que a conexão cai;
-                    // o motivo real está na conexão.
-                    Err(_) => {
-                        return match conn.close_reason() {
-                            Some(closed) => describe_close(&closed),
-                            None => "O canal de controle foi fechado.".to_string(),
-                        };
+                tokio::select! {
+                    msg = inbox.recv() => match msg {
+                        // A permissão é conferida aqui, no host: um visualizador
+                        // modificado não ganha controle só por mandar eventos.
+                        Some(ViewerMsg::Input(event)) if granted.control => sink.apply(event),
+                        Some(ViewerMsg::RequestKeyframe) => capture.keyframe.store(true, Ordering::Relaxed),
+                        Some(ViewerMsg::Bye) => return "O visualizador encerrou a sessão.".to_string(),
+                        Some(ViewerMsg::Clipboard(text)) if text.len() <= MAX_CLIPBOARD_TEXT => {
+                            if let Some(clipboard) = &mut clipboard {
+                                clipboard.set(&text);
+                            }
+                        }
+                        Some(ViewerMsg::Lock) if granted.control => self.backend.lock(),
+                        Some(ViewerMsg::SelectDisplay(wanted)) => {
+                            let wanted = wanted as usize;
+                            if wanted >= displays || wanted == index {
+                                continue;
+                            }
+                            // Solta o que estiver pressionado e para a captura
+                            // antiga antes de abrir a nova.
+                            sink.release_all();
+                            capture.stop().await;
+                            let next = generation.fetch_add(1, Ordering::AcqRel) + 1;
+                            match start_capture(self.backend.clone(), wanted, next, packets_tx.clone()).await {
+                                Ok((started, display)) => {
+                                    capture = started;
+                                    index = wanted;
+                                    sink = self.backend.open_sink(&display);
+                                    let msg = HostMsg::Display { index: index as u8, display: describe(&display) };
+                                    if send_msg(&mut tx, &msg).await.is_err() {
+                                        return "O canal de controle foi fechado.".to_string();
+                                    }
+                                }
+                                Err(err) => return format!("Não foi possível mostrar o monitor {}: {err:#}", wanted + 1),
+                            }
+                        }
+                        Some(_) => {}
+                        // A leitura falha no mesmo instante em que a conexão cai;
+                        // o motivo real está na conexão.
+                        None => {
+                            return match conn.close_reason() {
+                                Some(closed) => describe_close(&closed),
+                                None => "O canal de controle foi fechado.".to_string(),
+                            };
+                        }
+                    },
+                    _ = clipboard_tick.tick(), if clipboard.is_some() => {
+                        let copied = clipboard.as_mut().and_then(|clipboard| clipboard.poll());
+                        if let Some(text) = copied.filter(|text| text.len() <= MAX_CLIPBOARD_TEXT)
+                            && send_msg(&mut tx, &HostMsg::Clipboard(text)).await.is_err()
+                        {
+                            return "O canal de controle foi fechado.".to_string();
+                        }
                     }
                 }
             }
@@ -278,19 +396,15 @@ impl Host {
     }
 }
 
+fn describe(display: &DisplayInfo) -> DisplayDesc {
+    DisplayDesc { width: display.width as u16, height: display.height as u16, name: display.name.clone() }
+}
+
 struct ClearOnDrop(Arc<AtomicBool>);
 
 impl Drop for ClearOnDrop {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
-    }
-}
-
-struct StopOnDrop(Arc<AtomicBool>);
-
-impl Drop for StopOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
     }
 }
 
@@ -301,28 +415,65 @@ async fn deny(tx: &mut quinn::SendStream, conn: &quinn::Connection, reason: Deny
     let _ = timeout(Duration::from_secs(2), conn.closed()).await;
 }
 
-/// Thread de captura e codificação. O canal de capacidade 1 é a
-/// contrapressão: enquanto a rede não escoa o quadro anterior, esta thread
-/// fica parada no envio e as mudanças de tela se acumulam num único quadro
-/// seguinte, em vez de virarem fila e atraso.
-fn spawn_capture(
-    backend: Arc<dyn Backend>,
+/// O que a thread de captura entrega, marcado com a geração a que pertence.
+enum Captured {
+    Frame(u64, Vec<u8>),
+    /// A captura parou sozinha (erro), sem ninguém pedir.
+    Stopped(u64),
+}
+
+/// Uma captura em andamento. Descartar o valor manda a thread parar.
+struct Capture {
     stop: Arc<AtomicBool>,
     keyframe: Arc<AtomicBool>,
-    packets: mpsc::Sender<Vec<u8>>,
-    ready: oneshot::Sender<Result<DisplayInfo>>,
-) -> Result<()> {
+    done: Option<oneshot::Receiver<()>>,
+}
+
+impl Capture {
+    /// Para a captura e espera a thread soltar a tela: o Windows não deixa
+    /// duplicar a mesma saída duas vezes no mesmo processo.
+    async fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(done) = self.done.take() {
+            let _ = timeout(Duration::from_secs(2), done).await;
+        }
+    }
+}
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Sobe a thread de captura e codificação do monitor `display` e espera ela
+/// estar pronta. O canal de capacidade 1 é a contrapressão: enquanto a rede
+/// não escoa o quadro anterior, a thread fica parada no envio e as mudanças de
+/// tela se acumulam num único quadro seguinte, em vez de virarem fila e atraso.
+async fn start_capture(
+    backend: Arc<dyn Backend>,
+    display: usize,
+    generation: u64,
+    packets: mpsc::Sender<Captured>,
+) -> Result<(Capture, DisplayInfo)> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let keyframe = Arc::new(AtomicBool::new(false));
+    let (ready_tx, ready) = oneshot::channel::<Result<DisplayInfo>>();
+    let (done_tx, done) = oneshot::channel::<()>();
+    let capture = Capture { stop: stop.clone(), keyframe: keyframe.clone(), done: Some(done) };
     std::thread::Builder::new()
         .name("opendesk-capture".into())
         .spawn(move || {
-            let mut source = match backend.open_source() {
+            // Avisa que a tela foi solta, qualquer que seja a saída.
+            let _done = done_tx;
+            let mut source = match backend.open_source(display) {
                 Ok(source) => source,
                 Err(err) => {
-                    let _ = ready.send(Err(err));
+                    let _ = ready_tx.send(Err(err));
                     return;
                 }
             };
-            if ready.send(Ok(source.display())).is_err() {
+            if ready_tx.send(Ok(source.display())).is_err() {
                 return;
             }
             let mut encoder = Encoder::new(EncoderConfig::default());
@@ -345,16 +496,21 @@ fn spawn_capture(
                     Ok(None) => encoder.refine(),
                     Err(err) => {
                         tracing::warn!("captura de tela falhou: {err:#}");
+                        let _ = packets.blocking_send(Captured::Stopped(generation));
                         break;
                     }
                 };
                 if let Some(packet) = packet
-                    && packets.blocking_send(packet.encode()).is_err()
+                    && packets.blocking_send(Captured::Frame(generation, packet.encode())).is_err()
                 {
                     break;
                 }
             }
         })
         .context("criar thread de captura")?;
-    Ok(())
+    match timeout(HANDSHAKE_TIMEOUT, ready).await {
+        Ok(Ok(Ok(display))) => Ok((capture, display)),
+        Ok(Ok(Err(err))) => Err(err),
+        _ => Err(anyhow!("a captura de tela não iniciou")),
+    }
 }

@@ -6,8 +6,9 @@ use opendesk_net::{Identity, Node};
 use opendesk_platform::capture::{DisplayInfo, Frame};
 use opendesk_proto::control::{DenyReason, InputEvent, MouseButton, Permissions};
 use opendesk_session::Wake;
-use opendesk_session::backend::{Backend, FrameSource, InputSink};
-use opendesk_session::host::{Host, HostEvent};
+use opendesk_session::auth::PasswordAccess;
+use opendesk_session::backend::{Backend, Clipboard, FrameSource, InputSink};
+use opendesk_session::host::{Host, HostEvent, Unattended};
 use opendesk_session::viewer::{Route, Target, Viewer, ViewerEvent};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,23 +25,60 @@ struct Shared {
     version: AtomicU64,
     inputs: Mutex<Vec<InputEvent>>,
     released: AtomicU64,
+    /// O que "alguém copiou" no host e ainda não foi lido.
+    copied: Mutex<Option<String>>,
+    /// O que chegou do visualizador para a área de transferência do host.
+    pasted: Mutex<Vec<String>>,
+    locks: AtomicU64,
+    /// Como cada sessão começou: `true` = pela senha.
+    started: Mutex<Vec<bool>>,
+    password_failures: AtomicU64,
 }
 
 struct FakeBackend(Arc<Shared>);
 struct FakeSource {
     shared: Arc<Shared>,
+    display: usize,
     seen: u64,
     buffer: Vec<u8>,
 }
 struct FakeSink(Arc<Shared>);
+struct FakeClipboard(Arc<Shared>);
 
+/// Um host com dois monitores; o segundo mostra a mesma tela "em negativo".
 impl Backend for FakeBackend {
-    fn open_source(&self) -> Result<Box<dyn FrameSource>> {
-        Ok(Box::new(FakeSource { shared: self.0.clone(), seen: 0, buffer: Vec::new() }))
+    fn displays(&self) -> usize {
+        2
+    }
+    fn open_source(&self, display: usize) -> Result<Box<dyn FrameSource>> {
+        Ok(Box::new(FakeSource { shared: self.0.clone(), display, seen: 0, buffer: Vec::new() }))
     }
     fn open_sink(&self, _display: &DisplayInfo) -> Box<dyn InputSink> {
         Box::new(FakeSink(self.0.clone()))
     }
+    fn open_clipboard(&self) -> Option<Box<dyn Clipboard>> {
+        Some(Box::new(FakeClipboard(self.0.clone())))
+    }
+    fn lock(&self) {
+        self.0.locks.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl Clipboard for FakeClipboard {
+    fn poll(&mut self) -> Option<String> {
+        self.0.copied.lock().unwrap().take()
+    }
+    fn set(&mut self, text: &str) {
+        self.0.pasted.lock().unwrap().push(text.to_string());
+    }
+}
+
+/// O que o segundo monitor mostra quando o primeiro mostra `bgra`.
+fn second_display(mut bgra: Vec<u8>) -> Vec<u8> {
+    for pixel in bgra.as_chunks_mut::<4>().0 {
+        pixel[0] = !pixel[0];
+    }
+    bgra
 }
 
 impl FrameSource for FakeSource {
@@ -55,6 +93,9 @@ impl FrameSource for FakeSource {
         }
         self.seen = version;
         self.buffer = self.shared.screen.lock().unwrap().clone();
+        if self.display == 1 {
+            self.buffer = second_display(std::mem::take(&mut self.buffer));
+        }
         Ok(Some(Frame { data: &self.buffer, width: W, height: H, stride: W * 4 }))
     }
 }
@@ -97,21 +138,40 @@ fn no_wake() -> Wake {
 
 /// Sobe um host cuja "pessoa" responde a todo pedido com `answer`.
 fn start_host(answer: Option<Permissions>) -> (Arc<Shared>, Arc<Host>, SocketAddr, UnboundedReceiver<String>) {
+    start_host_with(Some(answer), None)
+}
+
+/// `answer: None` é um computador sem ninguém na frente: o pedido fica na
+/// tela, sem resposta. `unattended` liga a senha de acesso não supervisionado.
+fn start_host_with(
+    answer: Option<Option<Permissions>>,
+    unattended: Option<Unattended>,
+) -> (Arc<Shared>, Arc<Host>, SocketAddr, UnboundedReceiver<String>) {
     let shared = Arc::new(Shared::default());
     show(&shared, 1);
     let node = node();
     let addr = node.local_addr().unwrap();
     let (host, mut events) = Host::new(node, Arc::new(FakeBackend(shared.clone())), "host-de-teste".into(), no_wake());
+    host.set_unattended(unattended);
     tokio::spawn(host.clone().serve());
     let (ended_tx, ended) = tokio::sync::mpsc::unbounded_channel();
+    let probe = shared.clone();
     tokio::spawn(async move {
+        // Descartar a resposta equivale a recusar; sem ninguém, ela fica guardada.
+        let mut unanswered = Vec::new();
         while let Some(event) = events.recv().await {
             match event {
                 HostEvent::Request { peer, reply, .. } => {
                     assert_eq!(peer.name, "visualizador-de-teste");
-                    let _ = reply.send(answer);
+                    match answer {
+                        Some(answer) => drop(reply.send(answer)),
+                        None => unanswered.push(reply),
+                    }
                 }
-                HostEvent::Started { .. } => {}
+                HostEvent::Started { by_password, .. } => probe.started.lock().unwrap().push(by_password),
+                HostEvent::PasswordFailed { .. } => {
+                    probe.password_failures.fetch_add(1, Ordering::SeqCst);
+                }
                 HostEvent::Ended { reason, .. } => {
                     let _ = ended_tx.send(reason);
                 }
@@ -119,6 +179,10 @@ fn start_host(answer: Option<Permissions>) -> (Arc<Shared>, Arc<Host>, SocketAdd
         }
     });
     (shared, host, addr, ended)
+}
+
+fn unattended(password: &str, permissions: Permissions) -> Option<Unattended> {
+    Some(Unattended { access: PasswordAccess::create(password).unwrap(), permissions })
 }
 
 fn start_viewer(addr: SocketAddr, wants: Permissions) -> (Viewer, UnboundedReceiver<ViewerEvent>) {
@@ -147,13 +211,14 @@ async fn granted_session_streams_screen_and_delivers_input() {
 
     assert!(matches!(
         next(&mut events).await,
-        ViewerEvent::Connected { host_name, route: Route::Address, .. } if host_name == "host-de-teste"
+        ViewerEvent::Connected { host_name, route: Route::Address, password: false, .. } if host_name == "host-de-teste"
     ));
     assert!(viewer.rtt().is_some_and(|rtt| rtt < Duration::from_secs(1)));
     match next(&mut events).await {
-        ViewerEvent::Granted { permissions, display } => {
+        ViewerEvent::Granted { permissions, display, index, displays } => {
             assert!(permissions.control);
             assert_eq!((display.width as usize, display.height as usize), (W, H));
+            assert_eq!((index, displays), (0, 2));
         }
         other => panic!("esperava Granted, veio {other:?}"),
     }
@@ -262,4 +327,164 @@ async fn viewer_disconnect_ends_the_host_session() {
     drop(viewer);
     let reason = tokio::time::timeout(Duration::from_secs(10), ended.recv()).await.unwrap().unwrap();
     assert!(reason.contains("isualizador"), "{reason}");
+}
+
+// ─────────────────────── Acesso não supervisionado ───────────────────────
+
+const PASSWORD: &str = "correta cavalo bateria";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn right_password_opens_a_session_with_nobody_at_the_host() {
+    let (shared, _host, addr, _ended) = start_host_with(None, unattended(PASSWORD, Permissions::FULL));
+    let (viewer, mut events) = start_viewer(addr, Permissions::FULL);
+    assert!(matches!(next(&mut events).await, ViewerEvent::Connected { password: true, .. }));
+
+    viewer.submit_password(PASSWORD.into());
+    assert!(
+        matches!(next(&mut events).await, ViewerEvent::Granted { permissions, .. } if permissions == Permissions::FULL)
+    );
+    let expect = as_rgba(&screen(1));
+    until("primeiro quadro", || viewer.frame.lock().unwrap().rgba == expect).await;
+    assert_eq!(*shared.started.lock().unwrap(), [true], "a sessão deve constar como liberada pela senha");
+    assert_eq!(shared.password_failures.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn password_never_grants_more_than_it_was_configured_to() {
+    let (shared, _host, addr, _ended) = start_host_with(None, unattended(PASSWORD, Permissions::VIEW_ONLY));
+    let (viewer, mut events) = start_viewer(addr, Permissions::FULL);
+    next(&mut events).await;
+    viewer.submit_password(PASSWORD.into());
+    assert!(
+        matches!(next(&mut events).await, ViewerEvent::Granted { permissions, .. } if permissions == Permissions::VIEW_ONLY)
+    );
+    let expect = as_rgba(&screen(1));
+    until("primeiro quadro", || viewer.frame.lock().unwrap().rgba == expect).await;
+    viewer.send_input(InputEvent::Key { scancode: 0x1E, extended: false, down: true });
+    viewer.lock_remote();
+    viewer.request_keyframe();
+    let before = viewer.frame.lock().unwrap().frames;
+    // O quadro completo pedido por último prova que o host já processou o resto.
+    until("quadro completo", || viewer.frame.lock().unwrap().frames > before).await;
+    assert!(shared.inputs.lock().unwrap().is_empty());
+    assert_eq!(shared.locks.load(Ordering::SeqCst), 0, "sem permissão de controle não há bloqueio remoto");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wrong_passwords_are_refused_counted_and_end_up_locking_the_door() {
+    let (shared, _host, addr, _ended) = start_host_with(None, unattended(PASSWORD, Permissions::FULL));
+
+    // Três erros na mesma conexão: o terceiro já não deixa tentar de novo...
+    let (first, mut events) = start_viewer(addr, Permissions::FULL);
+    next(&mut events).await;
+    for expect_retry in [true, true, false] {
+        first.submit_password("palpite errado".into());
+        assert!(matches!(next(&mut events).await, ViewerEvent::PasswordRejected { retry } if retry == expect_retry));
+    }
+    // ...nem com a senha certa.
+    first.submit_password(PASSWORD.into());
+    assert!(matches!(next(&mut events).await, ViewerEvent::PasswordRejected { retry: false }));
+    assert_eq!(shared.password_failures.load(Ordering::SeqCst), 3);
+
+    // Outra conexão continua a contagem: no quinto erro, somando todas, a
+    // senha deixa de ser aceita por um tempo.
+    let (second, mut events) = start_viewer(addr, Permissions::FULL);
+    next(&mut events).await;
+    second.submit_password("outro palpite".into());
+    assert!(matches!(next(&mut events).await, ViewerEvent::PasswordRejected { retry: true }));
+    second.submit_password("mais um".into());
+    assert!(matches!(next(&mut events).await, ViewerEvent::PasswordRejected { retry: false }));
+    assert_eq!(shared.password_failures.load(Ordering::SeqCst), 5);
+
+    // Com a porta fechada, nem a senha certa numa conexão nova entra.
+    let (third, mut events) = start_viewer(addr, Permissions::FULL);
+    next(&mut events).await;
+    third.submit_password(PASSWORD.into());
+    assert!(matches!(next(&mut events).await, ViewerEvent::PasswordRejected { retry: false }));
+
+    assert!(shared.started.lock().unwrap().is_empty(), "nenhuma sessão pode ter começado");
+    assert_eq!(first.frame.lock().unwrap().frames + third.frame.lock().unwrap().frames, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn someone_at_the_host_can_still_approve_while_a_password_is_possible() {
+    let (shared, _host, addr, _ended) =
+        start_host_with(Some(Some(Permissions::VIEW_ONLY)), unattended(PASSWORD, Permissions::FULL));
+    let (_viewer, mut events) = start_viewer(addr, Permissions::FULL);
+    assert!(matches!(next(&mut events).await, ViewerEvent::Connected { password: true, .. }));
+    assert!(
+        matches!(next(&mut events).await, ViewerEvent::Granted { permissions, .. } if permissions == Permissions::VIEW_ONLY)
+    );
+    until("sessão registrada", || !shared.started.lock().unwrap().is_empty()).await;
+    assert_eq!(*shared.started.lock().unwrap(), [false]);
+}
+
+// ─────────────────── Área de transferência, monitores, bloqueio ───────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clipboard_text_travels_both_ways() {
+    let (shared, _host, addr, _ended) = start_host(Some(Permissions::FULL));
+    let (viewer, mut events) = start_viewer(addr, Permissions::FULL);
+    next(&mut events).await;
+    assert!(matches!(next(&mut events).await, ViewerEvent::Granted { permissions, .. } if permissions.clipboard));
+
+    *shared.copied.lock().unwrap() = Some("copiado no host".into());
+    assert!(matches!(next(&mut events).await, ViewerEvent::Clipboard(text) if text == "copiado no host"));
+
+    viewer.send_clipboard("copiado por quem vê".into());
+    until("texto colado no host", || !shared.pasted.lock().unwrap().is_empty()).await;
+    assert_eq!(*shared.pasted.lock().unwrap(), ["copiado por quem vê"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clipboard_stays_put_without_the_permission() {
+    let (shared, _host, addr, _ended) = start_host(Some(Permissions::VIEW_ONLY));
+    let (viewer, mut events) = start_viewer(addr, Permissions::FULL);
+    next(&mut events).await;
+    assert!(matches!(next(&mut events).await, ViewerEvent::Granted { permissions, .. } if !permissions.clipboard));
+    let expect = as_rgba(&screen(1));
+    until("primeiro quadro", || viewer.frame.lock().unwrap().rgba == expect).await;
+
+    *shared.copied.lock().unwrap() = Some("segredo do host".into());
+    viewer.send_clipboard("não deveria chegar".into());
+    // Dá tempo de mais de uma consulta à área de transferência do host.
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    assert!(shared.pasted.lock().unwrap().is_empty());
+    assert!(shared.copied.lock().unwrap().is_some(), "o host nem deve ler a área de transferência");
+    assert!(events.try_recv().is_err(), "nada deve ter chegado ao visualizador");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn switching_display_shows_the_other_monitor_and_back() {
+    let (shared, _host, addr, _ended) = start_host(Some(Permissions::FULL));
+    let (viewer, mut events) = start_viewer(addr, Permissions::FULL);
+    next(&mut events).await;
+    assert!(matches!(next(&mut events).await, ViewerEvent::Granted { index: 0, displays: 2, .. }));
+    let first = as_rgba(&screen(1));
+    let second = as_rgba(&second_display(screen(1)));
+    until("primeiro monitor", || viewer.frame.lock().unwrap().rgba == first).await;
+
+    viewer.select_display(7); // não existe: ignorado
+    viewer.select_display(1);
+    assert!(matches!(next(&mut events).await, ViewerEvent::Display { index: 1, .. }));
+    until("segundo monitor", || viewer.frame.lock().unwrap().rgba == second).await;
+
+    // A tela continua acompanhando no monitor novo, e dá para voltar.
+    show(&shared, 4);
+    let second = as_rgba(&second_display(screen(4)));
+    until("segundo monitor atualizado", || viewer.frame.lock().unwrap().rgba == second).await;
+    viewer.select_display(0);
+    assert!(matches!(next(&mut events).await, ViewerEvent::Display { index: 0, .. }));
+    let first = as_rgba(&screen(4));
+    until("de volta ao primeiro", || viewer.frame.lock().unwrap().rgba == first).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lock_request_reaches_the_host_when_control_is_allowed() {
+    let (shared, _host, addr, _ended) = start_host(Some(Permissions::FULL));
+    let (viewer, mut events) = start_viewer(addr, Permissions::FULL);
+    next(&mut events).await;
+    next(&mut events).await;
+    viewer.lock_remote();
+    until("bloqueio pedido", || shared.locks.load(Ordering::SeqCst) == 1).await;
 }
