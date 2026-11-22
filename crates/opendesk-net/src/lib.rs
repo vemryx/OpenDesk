@@ -12,8 +12,8 @@
 //!   por ID em vez de por endereço.
 //! * [`known`] — impressões digitais fixadas dos hosts já acessados.
 //!
-//! Ainda não implementado (ver `docs/ARCHITECTURE.md`): relay para quando a
-//! conexão direta não é possível.
+//! Quando a conexão direta não é possível, [`Node::relay_route`] faz a mesma
+//! conexão passar por um relay, que só repassa pacotes cifrados.
 
 pub mod identity;
 pub mod known;

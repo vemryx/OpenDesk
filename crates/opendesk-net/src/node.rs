@@ -19,10 +19,17 @@ use tokio::time::Instant;
 /// Nome TLS fictício: a autenticação é por impressão digital, não por nome.
 const TLS_NAME: &str = "opendesk.device";
 
-/// Quanto o QUIC pode enfileirar antes de bloquear quem envia. Pequeno de
-/// propósito: é essa contrapressão que faz o host pular quadros quando a rede
-/// não dá conta, em vez de acumular atraso.
+/// Quanto o QUIC pode enfileirar antes de bloquear quem envia. É só um teto:
+/// quem impede o vídeo de acumular atraso é o ritmo da sessão, que só produz
+/// um quadro quando a conexão tem caminho livre para ele. Este limite vale
+/// para o que não tem esse cuidado, como uma transferência de arquivo.
 const SEND_WINDOW: u32 = 2 * 1024 * 1024;
+
+/// O máximo que o outro lado segura uma confirmação de recebimento. O padrão
+/// do QUIC (25 ms) economiza pacotes, mas atrasa a detecção de perda e a
+/// medida da conexão em exatamente o que uma sessão interativa não tem de
+/// sobra.
+const MAX_ACK_DELAY: Duration = Duration::from_millis(5);
 
 const KEEP_ALIVE: Duration = Duration::from_secs(2);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -91,6 +98,19 @@ impl Node {
         transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into()?));
         transport.send_window(SEND_WINDOW as u64);
         transport.initial_rtt(INITIAL_RTT);
+        let mut acks = quinn::AckFrequencyConfig::default();
+        acks.max_ack_delay(Some(MAX_ACK_DELAY));
+        transport.ack_frequency_config(Some(acks));
+        // O controle de congestionamento padrão do QUIC (Cubic) trata toda
+        // perda como sinal de rede cheia e corta o envio pela metade. Numa
+        // conexão residencial com Wi-Fi, que perde pacote por ruído, isso
+        // derruba a banda útil a uma fração da real: medido com 2% de perda
+        // em 20 Mbit/s, sobram menos de 3. O BBR mede a banda e o atraso em
+        // vez de reagir a cada perda, e fica com mais que o dobro.
+        // `OPENDESK_CONGESTION=cubic` volta ao padrão, para comparar.
+        if std::env::var("OPENDESK_CONGESTION").as_deref() != Ok("cubic") {
+            transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+        }
         let transport = Arc::new(transport);
 
         let mut server_tls = rustls::ServerConfig::builder_with_provider(provider.clone())

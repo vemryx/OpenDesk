@@ -6,10 +6,11 @@
 //! "staging" e lida pela CPU, porque o codec atual roda na CPU.
 //!
 //! Limitações conhecidas: monitores rotacionados não são corrigidos, e a área
-//! de trabalho segura (UAC, tela de logon) só pode ser capturada por um
-//! processo SYSTEM, o que exige o serviço previsto no roteiro.
+//! de trabalho segura (UAC, tela de bloqueio) só pode ser capturada por um
+//! processo SYSTEM. É o que o [agente](super::agent) faz, com este mesmo
+//! capturador, quando o serviço do OpenDesk está instalado.
 
-use crate::capture::{DisplayInfo, Frame};
+use crate::capture::{DisplayInfo, Frame, FrameStore};
 use anyhow::{Context, Result, anyhow, bail};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HMODULE;
@@ -80,7 +81,6 @@ pub struct Capturer {
     duplication: Option<IDXGIOutputDuplication>,
     staging: Option<(ID3D11Texture2D, u32, u32)>,
     buffer: Vec<u8>,
-    size: (usize, usize),
     retry_after: Instant,
 }
 
@@ -96,7 +96,6 @@ impl Capturer {
             duplication: Some(duplication),
             staging: None,
             buffer: Vec::new(),
-            size: (0, 0),
             retry_after: Instant::now(),
         })
     }
@@ -109,6 +108,29 @@ impl Capturer {
     /// que nada mudou (ou que a captura está temporariamente indisponível,
     /// como durante um prompt do UAC).
     pub fn frame(&mut self, timeout_ms: u32) -> Result<Option<Frame<'_>>> {
+        let mut buffer = std::mem::take(&mut self.buffer);
+        let captured = self.frame_into(timeout_ms, &mut buffer);
+        self.buffer = buffer;
+        Ok(captured?.map(|(width, height)| Frame {
+            data: &self.buffer[..width * height * 4],
+            width,
+            height,
+            stride: width * 4,
+        }))
+    }
+
+    /// Abandona a duplicação atual e abre outra na próxima captura. O agente
+    /// chama isto quando o Windows troca de área de trabalho (UAC, tela de
+    /// bloqueio): a duplicação antiga pertence à área que saiu de cena.
+    pub fn reset(&mut self) {
+        self.duplication = None;
+        self.retry_after = Instant::now();
+    }
+
+    /// Como [`frame`](Self::frame), mas grava os pixels em `store` e devolve
+    /// só o tamanho do quadro. É o que permite ao agente capturar direto na
+    /// memória compartilhada com o aplicativo, sem uma cópia a mais.
+    pub fn frame_into(&mut self, timeout_ms: u32, store: &mut dyn FrameStore) -> Result<Option<(usize, usize)>> {
         if self.duplication.is_none() {
             // A duplicação foi perdida (troca de resolução, UAC, tela cheia
             // exclusiva). Tenta recriar, sem martelar o sistema.
@@ -150,19 +172,17 @@ impl Capturer {
 
             // LastPresentTime zero: só o ponteiro do mouse se mexeu.
             let image_changed = frame_info.LastPresentTime != 0;
-            let copied = if image_changed { self.copy_out(resource) } else { Ok(()) };
+            let copied = if image_changed { self.copy_out(resource, store).map(Some) } else { Ok(None) };
             let _ = duplication.ReleaseFrame();
-            copied?;
-            if !image_changed {
-                return Ok(None);
-            }
+            copied
         }
-
-        let (width, height) = self.size;
-        Ok(Some(Frame { data: &self.buffer, width, height, stride: width * 4 }))
     }
 
-    unsafe fn copy_out(&mut self, resource: Option<IDXGIResource>) -> Result<()> {
+    unsafe fn copy_out(
+        &mut self,
+        resource: Option<IDXGIResource>,
+        store: &mut dyn FrameStore,
+    ) -> Result<(usize, usize)> {
         unsafe {
             let texture: ID3D11Texture2D =
                 resource.ok_or_else(|| anyhow!("quadro sem textura"))?.cast().context("textura do quadro")?;
@@ -195,16 +215,17 @@ impl Capturer {
 
             let (width, height) = (desc.Width as usize, desc.Height as usize);
             let row = width * 4;
-            self.buffer.resize(row * height, 0);
             let pitch = mapped.RowPitch as usize;
             let src = std::slice::from_raw_parts(mapped.pData as *const u8, pitch * (height - 1) + row);
-            for y in 0..height {
-                self.buffer[y * row..(y + 1) * row].copy_from_slice(&src[y * pitch..y * pitch + row]);
-            }
+            let copied = store.reserve(row * height).map(|dest| {
+                for y in 0..height {
+                    dest[y * row..(y + 1) * row].copy_from_slice(&src[y * pitch..y * pitch + row]);
+                }
+            });
             self.context.Unmap(staging, 0);
-            self.size = (width, height);
+            copied?;
+            Ok((width, height))
         }
-        Ok(())
     }
 }
 

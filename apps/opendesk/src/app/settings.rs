@@ -8,6 +8,9 @@ use super::{App, CONTENT_WIDTH, LOGO_GAP, LOGO_HEIGHT, Screen, Tab};
 use crate::config::{self, ServerChoice, Settings, ThemeChoice};
 use crate::theme::{self, Palette};
 use eframe::egui::{self, Align, Layout, RichText, Vec2};
+use opendesk_platform::service::{self, ServiceState};
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::{Duration, Instant};
 
 /// Rascunho da aba Rede. Só vale depois de "Aplicar", para não reconectar a
 /// cada tecla digitada.
@@ -36,6 +39,45 @@ impl NetForm {
             || self.url.trim() != settings.rendezvous_url
             || self.relay.trim() != settings.relay
             || self.port.trim() != settings.port.map(|port| port.to_string()).unwrap_or_default()
+    }
+}
+
+/// O controle total: o serviço do sistema que deixa quem acessa alcançar o
+/// que o Windows nega a um programa comum.
+#[derive(Default)]
+pub(super) struct FullControl {
+    state: ServiceState,
+    /// O agente respondeu a este executável: o controle total está valendo.
+    active: bool,
+    checked: Option<Instant>,
+    /// Instalação ou remoção em andamento. Roda numa thread própria porque
+    /// espera a pessoa responder ao pedido de permissão do Windows.
+    job: Option<(Job, Receiver<Result<(), String>>)>,
+    /// Resultado da última operação: (deu certo, texto).
+    note: Option<(bool, String)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Job {
+    Install,
+    Remove,
+}
+
+#[derive(Clone, Copy)]
+enum FullControlAction {
+    Install,
+    Remove,
+    OpenInstalled,
+}
+
+impl FullControl {
+    /// De quanto em quanto tempo a tela confere o serviço.
+    const EVERY: Duration = Duration::from_secs(2);
+
+    pub(super) fn refresh(&mut self) {
+        self.state = service::state();
+        self.active = self.state.running && self.state.current && opendesk_platform::agent::available();
+        self.checked = Some(Instant::now());
     }
 }
 
@@ -160,6 +202,8 @@ impl App {
                     theme::toggle(ui, p, &mut settings.allow_control, "Permitir controle de mouse e teclado").changed();
             },
         );
+        self.full_control_row(ui, p);
+        let settings = &mut self.settings;
         theme::setting(
             ui,
             p,
@@ -237,6 +281,165 @@ impl App {
         }
         if changed {
             self.settings_changed();
+        }
+    }
+
+    /// A linha "Controle total" da aba Segurança.
+    fn full_control_row(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        self.poll_full_control();
+        let control = &self.full_control;
+        let busy = control.job.as_ref().map(|(job, _)| *job);
+        let (description, actions): (&str, &[(&str, &str, FullControlAction)]) = match &control.state {
+            state if !state.installed => (
+                "Sem ele, o Windows não deixa quem acessa clicar em janelas de administrador nem no aviso de permissão (UAC), e a tela de bloqueio não aparece. Instala um serviço do sistema e pede permissão de administrador.",
+                &[("Instalar", "", FullControlAction::Install)],
+            ),
+            state if !state.current => (
+                "Instalado, mas só vale para o OpenDesk aberto pelo menu Iniciar. Esta é outra cópia do programa.",
+                &[
+                    (
+                        "Abrir o instalado",
+                        "Fecha esta janela e abre o OpenDesk instalado",
+                        FullControlAction::OpenInstalled,
+                    ),
+                    ("Atualizar", "Substitui o OpenDesk instalado por esta versão", FullControlAction::Install),
+                ],
+            ),
+            _ if control.active => (
+                "Ativo. Quem acessa com controle alcança janelas de administrador, o aviso de permissão do Windows e a tela de bloqueio.",
+                &[("Remover", "Remove o serviço e o OpenDesk instalado", FullControlAction::Remove)],
+            ),
+            _ => (
+                "Instalado, mas o serviço não está respondendo.",
+                &[
+                    ("Reparar", "Reinstala e reinicia o serviço", FullControlAction::Install),
+                    ("Remover", "Remove o serviço e o OpenDesk instalado", FullControlAction::Remove),
+                ],
+            ),
+        };
+
+        let mut chosen = None;
+        theme::setting(ui, p, "Controle total", description, |ui| {
+            if let Some(job) = busy {
+                ui.add(egui::Spinner::new().size(14.0));
+                ui.label(theme::muted(if job == Job::Install { "Instalando" } else { "Removendo" }, p));
+                return;
+            }
+            for (text, hint, action) in actions {
+                let button = ui.button(*text);
+                let button = if hint.is_empty() { button } else { button.on_hover_text(*hint) };
+                if button.clicked() {
+                    chosen = Some(*action);
+                }
+            }
+        });
+        if let Some((ok, text)) = &self.full_control.note {
+            ui.label(RichText::new(text).small().color(if *ok { p.muted } else { p.danger }));
+        }
+        match chosen {
+            Some(FullControlAction::Install) => self.start_service_job(Job::Install),
+            Some(FullControlAction::Remove) => self.start_service_job(Job::Remove),
+            Some(FullControlAction::OpenInstalled) => self.open_installed(),
+            None => {}
+        }
+    }
+
+    /// Mantém o estado do serviço em dia enquanto a aba está aberta.
+    fn poll_full_control(&mut self) {
+        let control = &mut self.full_control;
+        if control.job.is_none() && control.checked.is_none_or(|at| at.elapsed() >= FullControl::EVERY) {
+            control.refresh();
+        }
+        // Outro programa pode instalar ou remover o serviço enquanto a aba
+        // está aberta; volta a conferir mesmo sem ninguém mexer na tela.
+        self.ctx.request_repaint_after(FullControl::EVERY);
+    }
+
+    /// Recolhe o resultado de uma instalação ou remoção em andamento. Roda a
+    /// cada quadro, em qualquer tela: quem saiu da aba no meio não fica com o
+    /// "Abrir com o Windows" apontando para o lugar errado.
+    pub(super) fn poll_service_job(&mut self) {
+        let control = &mut self.full_control;
+        let Some((job, result)) = &control.job else { return };
+        let (job, was_installed_copy) = (*job, control.state.current);
+        let outcome = match result.try_recv() {
+            Err(TryRecvError::Empty) => return,
+            Ok(outcome) => outcome,
+            Err(TryRecvError::Disconnected) => Err("A operação foi interrompida.".to_string()),
+        };
+        control.job = None;
+        control.refresh();
+        if let Err(problem) = outcome {
+            control.note = Some((false, problem));
+            return;
+        }
+        let active = control.active;
+        let text = match job {
+            Job::Install if active => "Controle total ativo.",
+            Job::Install => "Instalado. Abra o OpenDesk pelo menu Iniciar para usar o controle total.",
+            // Este é o OpenDesk que acabou de ser desinstalado: some do disco
+            // ao reiniciar, e um registro para abri-lo ficaria apontando para nada.
+            Job::Remove if was_installed_copy && self.autostart => {
+                self.set_autostart(false);
+                "Serviço removido. O OpenDesk instalado sai do disco quando o Windows reiniciar, e por isso deixou de abrir com o Windows."
+            }
+            Job::Remove if was_installed_copy => {
+                "Serviço removido. O OpenDesk instalado sai do disco quando o Windows reiniciar."
+            }
+            Job::Remove => "Serviço removido.",
+        };
+        self.full_control.note = Some((true, text.into()));
+        self.sync_autostart();
+    }
+
+    /// Garante que o "Abrir com o Windows" abre o OpenDesk certo: o instalado,
+    /// quando há um (só ele tem o controle total), e nunca um arquivo que não
+    /// existe mais. Não liga nem desliga a opção; só corrige o destino.
+    pub(super) fn sync_autostart(&mut self) {
+        // Cópias de desenvolvimento e de teste não mexem no registro de quem as roda.
+        if cfg!(debug_assertions) || self.quiet {
+            return;
+        }
+        let Some(command) = opendesk_platform::system::autostart_command() else { return };
+        let Ok(current) = std::env::current_exe() else { return };
+        let registered = config::command_exe(&command);
+        let state = &self.full_control.state;
+        let installed = state.path.as_deref().filter(|_| state.installed);
+        let exists = std::path::Path::new(registered).exists();
+        let Some(exe) = config::autostart_fix(registered, exists, installed, &current.to_string_lossy()) else {
+            return;
+        };
+        match opendesk_platform::system::set_autostart(Some(&config::autostart_command(&exe))) {
+            Ok(()) => tracing::info!("Abrir com o Windows agora abre {exe} (antes: {registered})"),
+            Err(err) => tracing::warn!("não foi possível corrigir a abertura com o Windows: {err:#}"),
+        }
+    }
+
+    fn start_service_job(&mut self, job: Job) {
+        let (sender, result) = std::sync::mpsc::channel();
+        let wake = self.wake.clone();
+        let argument = if job == Job::Install { "--install-service" } else { "--uninstall-service" };
+        let spawned = std::thread::Builder::new().name("opendesk-servico".into()).spawn(move || {
+            let _ = sender.send(service::elevate(argument).map_err(|err| format!("{err:#}")));
+            wake();
+        });
+        match spawned {
+            Ok(_) => {
+                self.full_control.note = None;
+                self.full_control.job = Some((job, result));
+            }
+            Err(err) => self.full_control.note = Some((false, format!("Não foi possível começar: {err}."))),
+        }
+    }
+
+    /// Passa a vez para o OpenDesk instalado, o único que o agente aceita.
+    fn open_installed(&mut self) {
+        let Some(path) = self.full_control.state.path.clone() else { return };
+        match std::process::Command::new(&path).spawn() {
+            Ok(_) => self.ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Err(err) => {
+                self.full_control.note = Some((false, format!("Não foi possível abrir {path}: {err}.")));
+            }
         }
     }
 
@@ -470,9 +673,18 @@ impl App {
 
     fn set_autostart(&mut self, on: bool) {
         let result = if on {
-            std::env::current_exe().map_err(anyhow::Error::from).and_then(|exe| {
-                opendesk_platform::system::set_autostart(Some(&format!("\"{}\" --minimized", exe.display())))
-            })
+            // Com o serviço instalado, quem abre com o Windows é o OpenDesk
+            // instalado, o único com o controle total, seja qual for a cópia
+            // em que a opção foi ligada.
+            self.full_control.refresh();
+            let state = &self.full_control.state;
+            let installed = state.path.clone().filter(|_| state.installed);
+            let exe = match installed {
+                Some(exe) => Ok(exe),
+                None => std::env::current_exe().map(|exe| exe.to_string_lossy().into_owned()),
+            };
+            exe.map_err(anyhow::Error::from)
+                .and_then(|exe| opendesk_platform::system::set_autostart(Some(&config::autostart_command(&exe))))
         } else {
             opendesk_platform::system::set_autostart(None)
         };

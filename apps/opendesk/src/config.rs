@@ -318,6 +318,44 @@ impl History {
     }
 }
 
+// ─────────────────────── Abrir com o Windows ───────────────────────
+
+/// O comando registrado para abrir `exe` junto com o Windows.
+pub fn autostart_command(exe: &str) -> String {
+    format!("\"{exe}\" --minimized")
+}
+
+/// O executável dentro de um comando de abertura, com ou sem aspas.
+pub fn command_exe(command: &str) -> &str {
+    let command = command.trim();
+    match command.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(rest),
+        None => command.split(" --").next().unwrap_or(command).trim_end(),
+    }
+}
+
+/// Decide se o registro de "Abrir com o Windows" precisa apontar para outro
+/// executável, e qual. `None` deixa como está.
+///
+/// * Com o serviço instalado, tem de ser o OpenDesk instalado (`installed`):
+///   é o único com o controle total, e abrir outra cópia deixaria quem acessa
+///   sem alcançar janelas de administrador sem entender por quê.
+/// * Sem o serviço, uma cópia que ainda existe é respeitada; uma que sumiu
+///   (movida, ou a instalada depois de removida) dá lugar a `current`.
+pub fn autostart_fix(
+    registered: &str,
+    registered_exists: bool,
+    installed: Option<&str>,
+    current: &str,
+) -> Option<String> {
+    let wanted = match installed {
+        Some(installed) => installed,
+        None if registered_exists => return None,
+        None => current,
+    };
+    (!registered.eq_ignore_ascii_case(wanted)).then(|| wanted.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,5 +484,35 @@ mod tests {
         for bad in ["relay.exemplo.com", ":47800", "host:0", "host:porta", "host:70000", ""] {
             assert!(!is_host_port(bad), "{bad}");
         }
+    }
+
+    const INSTALLED: &str = r"C:\Program Files\OpenDesk\OpenDesk.exe";
+    const PORTABLE: &str = r"C:\Users\ana\Downloads\opendesk.exe";
+
+    #[test]
+    fn command_exe_reads_quoted_and_bare_commands() {
+        assert_eq!(command_exe(&autostart_command(INSTALLED)), INSTALLED);
+        assert_eq!(command_exe(r"C:\Apps\opendesk.exe --minimized"), r"C:\Apps\opendesk.exe");
+        assert_eq!(command_exe(r"C:\Apps\opendesk.exe"), r"C:\Apps\opendesk.exe");
+    }
+
+    #[test]
+    fn autostart_follows_the_installed_copy() {
+        // Ligado na cópia portátil antes de instalar: passa a abrir o
+        // instalado, seja qual for a cópia que percebeu.
+        assert_eq!(autostart_fix(PORTABLE, true, Some(INSTALLED), PORTABLE).as_deref(), Some(INSTALLED));
+        assert_eq!(autostart_fix(PORTABLE, true, Some(INSTALLED), INSTALLED).as_deref(), Some(INSTALLED));
+        // Já aponta para o instalado (o Windows varia a grafia em maiúsculas).
+        assert_eq!(autostart_fix(&INSTALLED.to_uppercase(), true, Some(INSTALLED), PORTABLE), None);
+    }
+
+    #[test]
+    fn autostart_without_the_service_only_repairs_a_missing_target() {
+        let other = r"D:\Ferramentas\opendesk.exe";
+        // Outra cópia que existe é escolha da pessoa.
+        assert_eq!(autostart_fix(other, true, None, PORTABLE), None);
+        // O destino sumiu: o instalado foi removido, ou o arquivo foi movido.
+        assert_eq!(autostart_fix(INSTALLED, false, None, PORTABLE).as_deref(), Some(PORTABLE));
+        assert_eq!(autostart_fix(PORTABLE, false, None, PORTABLE), None);
     }
 }

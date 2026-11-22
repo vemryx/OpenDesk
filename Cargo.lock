@@ -2629,6 +2629,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "opendesk-proto",
+ "postcard",
+ "serde",
  "tracing",
  "windows",
 ]

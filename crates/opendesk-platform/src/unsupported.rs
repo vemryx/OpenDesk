@@ -102,3 +102,93 @@ pub mod clipboard {
         bail!(super::MSG)
     }
 }
+
+pub mod agent {
+    use crate::capture::{DisplayInfo, Frame};
+    use anyhow::{Result, bail};
+    use opendesk_proto::control::InputEvent;
+
+    pub fn available() -> bool {
+        false
+    }
+
+    pub fn run(_parent: Option<u32>) -> Result<()> {
+        bail!(super::MSG)
+    }
+
+    pub fn serve_unverified(_pipe: &str) -> Result<()> {
+        bail!(super::MSG)
+    }
+
+    pub struct RemoteCapturer(());
+
+    impl RemoteCapturer {
+        pub fn open(_display: usize) -> Result<Self> {
+            bail!(super::MSG)
+        }
+        pub fn open_unverified(_pipe: &str, _display: usize) -> Result<Self> {
+            bail!(super::MSG)
+        }
+        pub fn display(&self) -> &DisplayInfo {
+            unreachable!()
+        }
+        pub fn frame(&mut self, _timeout_ms: u32) -> Result<Option<Frame<'_>>> {
+            bail!(super::MSG)
+        }
+        pub fn advance(&mut self, _timeout_ms: u32) -> Result<bool> {
+            bail!(super::MSG)
+        }
+        pub fn current(&self) -> Frame<'_> {
+            unreachable!()
+        }
+    }
+
+    pub struct RemoteInjector(());
+
+    impl RemoteInjector {
+        pub fn open(_display: &DisplayInfo) -> Result<Self> {
+            bail!(super::MSG)
+        }
+        pub fn open_unverified(_pipe: &str, _display: &DisplayInfo) -> Result<Self> {
+            bail!(super::MSG)
+        }
+        pub fn apply(&mut self, _event: InputEvent) -> Result<()> {
+            bail!(super::MSG)
+        }
+        pub fn release_all(&mut self) -> Result<()> {
+            bail!(super::MSG)
+        }
+    }
+}
+
+pub mod service {
+    use anyhow::{Result, bail};
+    use std::path::PathBuf;
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ServiceState {
+        pub installed: bool,
+        pub running: bool,
+        pub path: Option<String>,
+        pub current: bool,
+    }
+
+    pub fn state() -> ServiceState {
+        ServiceState::default()
+    }
+    pub fn install() -> Result<()> {
+        bail!(super::MSG)
+    }
+    pub fn uninstall() -> Result<()> {
+        bail!(super::MSG)
+    }
+    pub fn elevate(_argument: &str) -> Result<()> {
+        bail!(super::MSG)
+    }
+    pub fn run() -> Result<()> {
+        bail!(super::MSG)
+    }
+    pub fn log_path() -> Option<PathBuf> {
+        None
+    }
+}

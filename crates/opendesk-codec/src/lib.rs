@@ -12,6 +12,14 @@
 //! reenvia essas áreas sem perdas. O resultado é imagem nítida em repouso e
 //! banda baixa em movimento.
 //!
+//! Quem envia pode dar a cada quadro um alvo de bytes
+//! ([`Encoder::encode_within`]): o que a conexão escoa no tempo de um quadro.
+//! Uma mudança pequena cabe inteira e sai perfeita. Quando a tela toda muda e
+//! a conexão é lenta, o codificador desce uma escada de qualidade (JPEG mais
+//! forte, depois metade e um quarto da resolução) até caber, e o refinamento
+//! devolve a nitidez assim que a tela para. É a diferença entre uma imagem
+//! borrada por um instante e uma imagem atrasada por segundos.
+//!
 //! O codificador não depende de quadros anteriores do lado receptor além do
 //! que ele mesmo já enviou, então o emissor pode pular quadros à vontade
 //! quando a rede não dá conta: a diferença é sempre contra o último enviado.
@@ -163,6 +171,83 @@ mod tests {
     }
 
     #[test]
+    fn a_tight_budget_shrinks_the_frame_and_refinement_restores_it() {
+        let (w, h) = (640, 384);
+        let src = noise_frame(w, h);
+        let full = Encoder::new(EncoderConfig::default()).encode(&frame(&src, w, h)).unwrap();
+        let full_bytes: usize = full.patches.iter().map(|p| p.data.len()).sum();
+
+        let budget = full_bytes / 12;
+        let mut enc = Encoder::new(EncoderConfig::default());
+        let pkt = enc.encode_within(&frame(&src, w, h), budget).unwrap();
+        let bytes: usize = pkt.patches.iter().map(|p| p.data.len()).sum();
+        assert!(bytes <= budget * 2, "{bytes} bytes para um alvo de {budget}");
+        assert!(pkt.patches.iter().any(|p| p.encoding.scale() > 1), "ruído só cabe em resolução reduzida");
+
+        // O que chega é reconhecível: a média de cada bloco bate com a do original.
+        let mut fb = vec![0u8; w * h * 4];
+        apply(&mut fb, w, &decode_packet(&pkt).unwrap());
+        let exact = bgra_to_rgba(&src);
+        let mean = |image: &[u8]| image.iter().map(|&b| b as u64).sum::<u64>() / image.len() as u64;
+        assert!(mean(&fb).abs_diff(mean(&exact)) <= 3);
+        assert_ne!(fb, exact);
+
+        // Tela parada: os refinamentos, em passos pequenos, chegam ao exato.
+        let mut rounds = 0;
+        while let Some(pkt) = enc.refine_within(budget) {
+            apply(&mut fb, w, &decode_packet(&pkt).unwrap());
+            rounds += 1;
+            assert!(rounds < 2000, "refinamento não termina");
+        }
+        assert!(rounds > 2, "com alvo pequeno o refinamento vem em vários passos");
+        assert!(!enc.has_lossy());
+        assert_eq!(fb, exact);
+    }
+
+    #[test]
+    fn a_budget_that_fits_costs_no_quality() {
+        let (w, h) = (640, 360);
+        let src = ui_frame(w, h);
+        let unlimited = Encoder::new(EncoderConfig::default()).encode(&frame(&src, w, h)).unwrap();
+        let bytes: usize = unlimited.patches.iter().map(|p| p.data.len()).sum();
+
+        // Com espaço de sobra para a versão boa, é ela que vai: tudo sem
+        // perdas, a imagem idêntica, nada a refinar depois.
+        let mut enc = Encoder::new(EncoderConfig::default());
+        let within = enc.encode_within(&frame(&src, w, h), bytes * 2).unwrap();
+        assert!(within.patches.iter().all(|p| p.encoding == PatchEncoding::ZstdRgb));
+        assert!(!enc.has_lossy());
+        let mut fb = vec![0u8; w * h * 4];
+        apply(&mut fb, w, &decode_packet(&within).unwrap());
+        assert_eq!(fb, bgra_to_rgba(&src));
+    }
+
+    #[test]
+    fn flat_content_stays_lossless_under_any_budget() {
+        // Cor chapada comprime a quase nada sem perdas: um JPEG seria maior.
+        let (w, h) = (512, 256);
+        let src = vec![200u8; w * h * 4];
+        let mut enc = Encoder::new(EncoderConfig::default());
+        let pkt = enc.encode_within(&frame(&src, w, h), 64).unwrap();
+        assert!(pkt.patches.iter().all(|p| p.encoding == PatchEncoding::ZstdRgb));
+        assert!(!enc.has_lossy());
+    }
+
+    #[test]
+    fn reduced_patches_decode_at_odd_sizes() {
+        // Tamanho que não é múltiplo de 4: as bordas da ampliação não podem
+        // ler fora da imagem reduzida.
+        let (w, h) = (333, 201);
+        let src = noise_frame(w, h);
+        let mut enc = Encoder::new(EncoderConfig::default());
+        let pkt = enc.encode_within(&frame(&src, w, h), 2_000).unwrap();
+        assert!(pkt.patches.iter().any(|p| p.encoding.scale() >= 4));
+        let mut fb = vec![0u8; w * h * 4];
+        apply(&mut fb, w, &decode_packet(&pkt).unwrap());
+        assert!(fb.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
+    }
+
+    #[test]
     fn resize_forces_a_keyframe() {
         let mut enc = Encoder::new(EncoderConfig::default());
         let a = ui_frame(320, 200);
@@ -189,7 +274,13 @@ mod tests {
     #[test]
     fn decoder_rejects_garbage_payloads() {
         use opendesk_proto::video::{FramePacket, Patch};
-        for encoding in [PatchEncoding::ZstdRgb, PatchEncoding::Jpeg] {
+        for encoding in [
+            PatchEncoding::ZstdRgb,
+            PatchEncoding::Jpeg,
+            PatchEncoding::JpegHalf,
+            PatchEncoding::JpegQuarter,
+            PatchEncoding::JpegEighth,
+        ] {
             let pkt = FramePacket {
                 seq: 0,
                 width: 64,

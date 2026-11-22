@@ -93,6 +93,8 @@ pub struct App {
     password_note: Option<(bool, String)>,
     /// Se o OpenDesk está registrado para abrir com o sistema.
     autostart: bool,
+    /// O serviço do controle total, como a aba Segurança o mostra.
+    full_control: settings::FullControl,
     recents: Recents,
     history: History,
     /// Os eventos mais recentes do histórico, para a tela de configurações.
@@ -229,6 +231,8 @@ struct Outgoing {
     displays: u8,
     /// Mouse e teclado não são enviados enquanto pausado.
     paused: bool,
+    /// O host alcança janelas de administrador, UAC e tela de bloqueio.
+    full_control: bool,
     /// Presente quando a sessão sincroniza a área de transferência.
     clipboard: Option<SystemClipboard>,
     texture: Option<TextureHandle>,
@@ -341,6 +345,7 @@ impl App {
             settings,
             settings_problem: None,
             autostart: opendesk_platform::system::autostart_command().is_some(),
+            full_control: Default::default(),
             recents: Recents::load(&data_dir),
             history_view: History::new(&data_dir).latest(200),
             history: History::new(&data_dir),
@@ -373,6 +378,8 @@ impl App {
         };
         app.start_presence();
         app.apply_host_policy();
+        app.full_control.refresh();
+        app.sync_autostart();
         #[cfg(debug_assertions)]
         app.preview();
         // `--minimized` é como o Windows abre o app junto com o sistema.
@@ -753,6 +760,7 @@ impl App {
             display_index: 0,
             displays: 1,
             paused: false,
+            full_control: false,
             clipboard: None,
             texture: None,
             epoch: 0,
@@ -785,6 +793,7 @@ impl App {
     }
 
     fn pump(&mut self, ctx: &egui::Context) {
+        self.poll_service_job();
         while let Ok(event) = self.host_events.try_recv() {
             match event {
                 HostEvent::Request { session, peer, reply } => {
@@ -847,8 +856,9 @@ impl App {
                         out.route = Some(route);
                         out.stage = Stage::Waiting;
                     }
-                    ViewerEvent::Granted { permissions, index, displays, .. } => {
+                    ViewerEvent::Granted { permissions, index, displays, full_control, .. } => {
                         out.stage = Stage::Live { permissions };
+                        out.full_control = full_control;
                         out.live_since = Some(Instant::now());
                         // A senha foi aceita se era ela que estava em conferência.
                         out.by_password = out.password_try == PasswordTry::Checking;
@@ -1430,19 +1440,32 @@ impl App {
                                 out.viewer.select_display((out.display_index + 1) % out.displays);
                             }
                         }
+                        // Um rótulo só, para a barra caber em janelas estreitas.
+                        let limited = permissions.control && !out.full_control && !out.paused;
                         let mode = match (permissions.control, out.paused) {
+                            (true, false) if limited => "Controle limitado",
                             (true, false) => "Controle ativo",
                             (true, true) => "Controle pausado",
                             (false, _) => "Somente visualização",
                         };
-                        ui.label(theme::muted(mode, p).small());
+                        if limited {
+                            ui.label(RichText::new(mode).small().color(p.danger)).on_hover_text(
+                                "O computador remoto está sem o controle total: janelas de administrador e o aviso de permissão do Windows não respondem a cliques, e a tela de bloqueio não aparece. Para liberar, alguém nesse computador instala em Configurações, Segurança, Controle total.",
+                            );
+                        } else {
+                            ui.label(theme::muted(mode, p).small());
+                        }
                         ui.add_space(8.0);
                         // Transparência sem ruído: o essencial na barra, o resto no ponteiro.
-                        ui.label(
-                            theme::muted(format!("{:.0} quadros/s   {:.1} Mbit/s", out.stats.fps, out.stats.mbps), p)
-                                .small(),
-                        )
-                        .on_hover_text(format!("Tela de {}×{}, codec Tiles v1", out.size[0], out.size[1]));
+                        // Numa janela estreita os números cedem o lugar, em vez de
+                        // se sobreporem ao que está à esquerda.
+                        let stats = format!("{:.0} quadros/s   {:.1} Mbit/s", out.stats.fps, out.stats.mbps);
+                        let font = egui::TextStyle::Small.resolve(ui.style());
+                        let needed = ui.painter().layout_no_wrap(stats.clone(), font, Color32::PLACEHOLDER).size().x;
+                        if ui.available_width() >= needed + 8.0 {
+                            ui.label(theme::muted(stats, p).small())
+                                .on_hover_text(format!("Tela de {}×{}, codec Tiles v1", out.size[0], out.size[1]));
+                        }
                     });
                 });
             });

@@ -1,6 +1,7 @@
 use crate::auth::{HostExchange, MAX_FAILURES_PER_CONNECTION, PasswordAccess, Throttle};
 use crate::backend::Backend;
 use crate::files::{self, FileEvent, FileState};
+use crate::pacing::Gate;
 use crate::{Wake, describe_close};
 use anyhow::{Context, Result, anyhow, bail};
 use opendesk_codec::{Encoder, EncoderConfig, FrameRef};
@@ -23,6 +24,12 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Espera máxima por mudança na tela antes de aproveitar para refinar.
 const CAPTURE_POLL_MS: u32 = 40;
+/// A mesma espera quando há o que refinar: o refinamento anda no ritmo da
+/// conexão, não no da captura.
+const REFINE_POLL_MS: u32 = 4;
+/// De quanto em quanto tempo a captura, parada à espera de caminho livre na
+/// conexão, confere se a sessão acabou.
+const GATE_POLL: Duration = Duration::from_millis(20);
 /// De quanto em quanto tempo o host olha se algo novo foi copiado.
 const CLIPBOARD_POLL: Duration = Duration::from_millis(400);
 
@@ -365,8 +372,12 @@ impl Host {
         // Cada troca de monitor começa uma geração nova de quadros; os da
         // geração anterior que ainda estiverem a caminho são descartados.
         let generation = Arc::new(AtomicU64::new(0));
+        // O ritmo do vídeo desta sessão: sobrevive às trocas de monitor,
+        // porque mede a conexão e não a tela.
+        let gate = Arc::new(Gate::default());
         let (packets_tx, mut packets) = mpsc::channel::<Captured>(1);
-        let (mut capture, display) = match start_capture(self.backend.clone(), index, 0, packets_tx.clone()).await {
+        let started = start_capture(self.backend.clone(), index, 0, packets_tx.clone(), gate.clone()).await;
+        let (mut capture, display) = match started {
             Ok(started) => started,
             Err(err) => {
                 deny(&mut tx, conn, DenyReason::CaptureUnavailable).await;
@@ -381,6 +392,7 @@ impl Host {
                 display: describe(&display),
                 index: index as u8,
                 displays: displays as u8,
+                full_control: granted.control && self.backend.full_control(),
             }),
         )
         .await?;
@@ -393,11 +405,14 @@ impl Host {
             let mut stream = conn.open_uni().await.context("abrir canal de vídeo")?;
             while let Some(captured) = packets.recv().await {
                 match captured {
-                    Captured::Frame(of, packet) if of == current.load(Ordering::Acquire) => {
+                    Captured::Frame(of, _, packet) if of == current.load(Ordering::Acquire) => {
                         write_frame(&mut stream, &packet).await.context("enviar quadro")?;
                     }
                     Captured::Stopped(of) if of == current.load(Ordering::Acquire) => break,
-                    Captured::Frame(..) | Captured::Stopped(_) => {}
+                    // De um monitor que já não é o mostrado: não vai para a
+                    // rede, então também não ocupa lugar na conta do ritmo.
+                    Captured::Frame(_, id, _) => gate.dropped(id),
+                    Captured::Stopped(_) => {}
                 }
             }
             anyhow::Ok("A captura de tela parou.".to_string())
@@ -411,6 +426,11 @@ impl Host {
                         // modificado não ganha controle só por mandar eventos.
                         Some(ViewerMsg::Input(event)) if granted.control => sink.apply(event),
                         Some(ViewerMsg::RequestKeyframe) => capture.keyframe.store(true, Ordering::Relaxed),
+                        // Quem vê já tem este quadro na tela: há caminho
+                        // livre para o próximo, e uma medida da conexão.
+                        Some(ViewerMsg::Seen { seq, spent_us }) => {
+                            gate.seen(seq, conn.rtt(), Duration::from_micros(spent_us as u64));
+                        }
                         Some(ViewerMsg::Bye) => return "O visualizador encerrou a sessão.".to_string(),
                         Some(ViewerMsg::Clipboard(text)) if text.len() <= MAX_CLIPBOARD_TEXT => {
                             if let Some(clipboard) = &mut clipboard {
@@ -428,7 +448,9 @@ impl Host {
                             sink.release_all();
                             capture.stop().await;
                             let next = generation.fetch_add(1, Ordering::AcqRel) + 1;
-                            match start_capture(self.backend.clone(), wanted, next, packets_tx.clone()).await {
+                            let started =
+                                start_capture(self.backend.clone(), wanted, next, packets_tx.clone(), gate.clone());
+                            match started.await {
                                 Ok((started, display)) => {
                                     capture = started;
                                     index = wanted;
@@ -503,9 +525,68 @@ async fn deny(tx: &mut quinn::SendStream, conn: &quinn::Connection, reason: Deny
     let _ = timeout(Duration::from_secs(2), conn.closed()).await;
 }
 
+/// Para onde vai o tempo de cada quadro. Com `OPENDESK_TRACE_VIDEO` definida,
+/// o host registra uma linha por segundo com as médias: é assim que se vê se
+/// quem limita a fluidez é a conexão (espera), a captura ou o codec.
+struct Meter {
+    enabled: bool,
+    since: Instant,
+    frames: u32,
+    bytes: usize,
+    budget: usize,
+    waiting: Duration,
+    capturing: Duration,
+    encoding: Duration,
+}
+
+impl Meter {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var_os("OPENDESK_TRACE_VIDEO").is_some(),
+            since: Instant::now(),
+            frames: 0,
+            bytes: 0,
+            budget: 0,
+            waiting: Duration::ZERO,
+            capturing: Duration::ZERO,
+            encoding: Duration::ZERO,
+        }
+    }
+
+    fn frame(&mut self, bytes: usize, budget: usize, waiting: Duration, capturing: Duration, encoding: Duration) {
+        self.frames += 1;
+        self.bytes += bytes;
+        self.budget = budget;
+        self.waiting += waiting;
+        self.capturing += capturing;
+        self.encoding += encoding;
+    }
+
+    fn report(&mut self, gate: &Gate) {
+        if !self.enabled || self.since.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        if self.frames > 0 {
+            let per_frame = |total: Duration| total.as_secs_f64() * 1000.0 / self.frames as f64;
+            tracing::info!(
+                "vídeo: {} quadros/s, {:.0} kB por quadro (alvo {:.0} kB), conexão {:.1} Mbit/s; por quadro:                  espera {:.1} ms, captura {:.1} ms, codec {:.1} ms",
+                self.frames,
+                self.bytes as f64 / 1000.0 / self.frames as f64,
+                self.budget as f64 / 1000.0,
+                gate.rate() * 8.0 / 1e6,
+                per_frame(self.waiting),
+                per_frame(self.capturing),
+                per_frame(self.encoding),
+            );
+        }
+        *self = Self { enabled: true, ..Self::new() };
+    }
+}
+
 /// O que a thread de captura entrega, marcado com a geração a que pertence.
 enum Captured {
-    Frame(u64, Vec<u8>),
+    /// Geração, número do quadro e o pacote já serializado.
+    Frame(u64, u32, Vec<u8>),
     /// A captura parou sozinha (erro), sem ninguém pedir.
     Stopped(u64),
 }
@@ -535,14 +616,16 @@ impl Drop for Capture {
 }
 
 /// Sobe a thread de captura e codificação do monitor `display` e espera ela
-/// estar pronta. O canal de capacidade 1 é a contrapressão: enquanto a rede
-/// não escoa o quadro anterior, a thread fica parada no envio e as mudanças de
-/// tela se acumulam num único quadro seguinte, em vez de virarem fila e atraso.
+/// estar pronta. Quem dita o ritmo é o `gate`: a thread só captura e codifica
+/// quando a conexão tem caminho livre para mais um quadro. Enquanto não tem,
+/// as mudanças de tela se acumulam na captura e saem todas no quadro
+/// seguinte, em vez de virarem fila de quadros velhos e atraso.
 async fn start_capture(
     backend: Arc<dyn Backend>,
     display: usize,
     generation: u64,
     packets: mpsc::Sender<Captured>,
+    gate: Arc<Gate>,
 ) -> Result<(Capture, DisplayInfo)> {
     let stop = Arc::new(AtomicBool::new(false));
     let keyframe = Arc::new(AtomicBool::new(false));
@@ -565,8 +648,16 @@ async fn start_capture(
                 return;
             }
             let mut encoder = Encoder::new(EncoderConfig::default());
+            let mut meter = Meter::new();
             while !stop.load(Ordering::Relaxed) {
-                let packet = match source.frame(CAPTURE_POLL_MS) {
+                // O alvo de bytes vem do que a conexão escoou até agora.
+                let asked = Instant::now();
+                let Some(budget) = gate.wait(GATE_POLL) else { continue };
+                let cleared = Instant::now();
+                let poll = if encoder.has_lossy() { REFINE_POLL_MS } else { CAPTURE_POLL_MS };
+                let captured = source.frame(poll);
+                let grabbed = Instant::now();
+                let packet = match captured {
                     Ok(Some(frame)) => {
                         let frame = FrameRef {
                             data: frame.data,
@@ -574,25 +665,34 @@ async fn start_capture(
                             height: frame.height,
                             stride: frame.stride,
                         };
-                        let delta = encoder.encode(&frame);
+                        let delta = encoder.encode_within(&frame, budget);
                         // Um pedido de quadro completo substitui o delta.
-                        if keyframe.swap(false, Ordering::Relaxed) { encoder.keyframe() } else { delta }
+                        if keyframe.swap(false, Ordering::Relaxed) { encoder.keyframe_within(budget) } else { delta }
                     }
-                    Ok(None) if keyframe.swap(false, Ordering::Relaxed) => encoder.keyframe(),
-                    // Tela parada: aproveita para reenviar sem perdas o que
-                    // foi como JPEG.
-                    Ok(None) => encoder.refine(),
+                    Ok(None) if keyframe.swap(false, Ordering::Relaxed) => encoder.keyframe_within(budget),
+                    // Tela parada: aproveita para devolver a nitidez ao que
+                    // foi reduzido ou como JPEG.
+                    Ok(None) => encoder.refine_within(budget),
                     Err(err) => {
                         tracing::warn!("captura de tela falhou: {err:#}");
                         let _ = packets.blocking_send(Captured::Stopped(generation));
                         break;
                     }
                 };
-                if let Some(packet) = packet
-                    && packets.blocking_send(Captured::Frame(generation, packet.encode())).is_err()
-                {
-                    break;
+                if let Some(mut packet) = packet {
+                    // O número do quadro é o da sessão, não o do codificador:
+                    // é por ele que quem vê confirma, e ele não recomeça
+                    // quando o monitor mostrado muda.
+                    let id = gate.begin();
+                    packet.seq = id;
+                    let bytes = packet.encode();
+                    gate.sent(id, bytes.len());
+                    meter.frame(bytes.len(), budget, cleared - asked, grabbed - cleared, grabbed.elapsed());
+                    if packets.blocking_send(Captured::Frame(generation, id, bytes)).is_err() {
+                        break;
+                    }
                 }
+                meter.report(&gate);
             }
         })
         .context("criar thread de captura")?;

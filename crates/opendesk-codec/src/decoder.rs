@@ -49,17 +49,56 @@ fn decode_patch(p: &Patch) -> Result<DecodedPatch, DecodeError> {
             }
             out
         }
-        PatchEncoding::Jpeg => {
-            let options =
-                DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA).set_max_width(w).set_max_height(h);
+        PatchEncoding::Jpeg | PatchEncoding::JpegHalf | PatchEncoding::JpegQuarter | PatchEncoding::JpegEighth => {
+            // A imagem que veio pode ser menor que a região: o emissor a
+            // reduziu para caber na conexão, e aqui ela é ampliada de volta.
+            let scale = p.encoding.scale();
+            let (small_w, small_h) = (w.div_ceil(scale), h.div_ceil(scale));
+            let options = DecoderOptions::default()
+                .jpeg_set_out_colorspace(ColorSpace::RGBA)
+                .set_max_width(small_w)
+                .set_max_height(small_h);
             let mut decoder = JpegDecoder::new_with_options(&p.data[..], options);
-            let out = decoder.decode().map_err(|e| DecodeError::Jpeg(format!("{e:?}")))?;
-            let expected = w * h * 4;
-            if out.len() != expected {
-                return Err(DecodeError::SizeMismatch { expected, got: out.len() });
+            let small = decoder.decode().map_err(|e| DecodeError::Jpeg(format!("{e:?}")))?;
+            let expected = small_w * small_h * 4;
+            if small.len() != expected {
+                return Err(DecodeError::SizeMismatch { expected, got: small.len() });
             }
-            out
+            if scale == 1 { small } else { enlarge(&small, small_w, small_h, w, h, scale) }
         }
     };
     Ok(DecodedPatch { x: p.x as usize, y: p.y as usize, w, h, rgba })
+}
+
+/// Amplia `scale` vezes com interpolação bilinear, para `w`×`h` pixels.
+/// Cada pixel reduzido representa o centro do bloco que ele substituiu.
+fn enlarge(small: &[u8], small_w: usize, small_h: usize, w: usize, h: usize, scale: usize) -> Vec<u8> {
+    /// Para cada posição ampliada: os dois vizinhos reduzidos e o peso do
+    /// segundo, de 0 a 256.
+    fn taps(len: usize, small_len: usize, scale: usize) -> Vec<(usize, usize, u32)> {
+        (0..len)
+            .map(|i| {
+                // Em unidades de 1/(2·scale) de pixel reduzido, para ficar em inteiros.
+                let position = (2 * i + 1).saturating_sub(scale);
+                let first = (position / (2 * scale)).min(small_len - 1);
+                let second = (first + 1).min(small_len - 1);
+                let weight = if 2 * i + 1 < scale { 0 } else { (position % (2 * scale)) * 256 / (2 * scale) };
+                (first, second, weight as u32)
+            })
+            .collect()
+    }
+    let (columns, rows) = (taps(w, small_w, scale), taps(h, small_h, scale));
+    let mut out = vec![255u8; w * h * 4];
+    for (y, &(top, bottom, wy)) in rows.iter().enumerate() {
+        let (top, bottom) = (&small[top * small_w * 4..], &small[bottom * small_w * 4..]);
+        let line = &mut out[y * w * 4..(y + 1) * w * 4];
+        for (pixel, &(left, right, wx)) in line.as_chunks_mut::<4>().0.iter_mut().zip(&columns) {
+            for channel in 0..3 {
+                let mix =
+                    |row: &[u8]| row[left * 4 + channel] as u32 * (256 - wx) + row[right * 4 + channel] as u32 * wx;
+                pixel[channel] = ((mix(top) * (256 - wy) + mix(bottom) * wy + (1 << 15)) >> 16) as u8;
+            }
+        }
+    }
+    out
 }

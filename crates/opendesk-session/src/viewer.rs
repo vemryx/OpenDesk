@@ -130,6 +130,9 @@ pub enum ViewerEvent {
         /// Qual monitor do host está sendo mostrado, e quantos ele tem.
         index: u8,
         displays: u8,
+        /// O host alcança janelas de administrador, o aviso de permissão do
+        /// Windows e a tela de bloqueio.
+        full_control: bool,
     },
     /// A senha enviada não conferiu. `retry`: dá para tentar de novo agora.
     PasswordRejected {
@@ -507,8 +510,8 @@ impl Task {
         let permissions = loop {
             tokio::select! {
                 msg = inbox.recv() => match msg {
-                    Some(HostMsg::Decision(Decision::Granted { permissions, display, index, displays })) => {
-                        self.emit(ViewerEvent::Granted { permissions, display, index, displays });
+                    Some(HostMsg::Decision(Decision::Granted { permissions, display, index, displays, full_control })) => {
+                        self.emit(ViewerEvent::Granted { permissions, display, index, displays, full_control });
                         break permissions;
                     }
                     Some(HostMsg::Decision(Decision::Denied { reason })) => {
@@ -577,7 +580,9 @@ impl Task {
             }
         };
 
-        let video = self.receive_video(conn);
+        // Os quadros já aplicados, para confirmar ao host.
+        let (seen_tx, mut seen) = mpsc::unbounded_channel::<(u32, Duration)>();
+        let video = self.receive_video(conn, seen_tx);
 
         // Cada arquivo que o host envia abre um stream próprio.
         let incoming_files = async {
@@ -603,7 +608,25 @@ impl Task {
         };
 
         let outgoing = async {
-            while let Some(mut command) = commands.recv().await {
+            loop {
+                let mut command = tokio::select! {
+                    // A confirmação vai na frente de tudo: é ela que libera
+                    // o próximo quadro no host.
+                    biased;
+                    Some((mut seq, mut spent)) = seen.recv() => {
+                        // Só a mais recente importa; ela vale pelas anteriores.
+                        while let Ok(newer) = seen.try_recv() {
+                            (seq, spent) = newer;
+                        }
+                        let spent_us = spent.as_micros().min(u32::MAX as u128) as u32;
+                        send_msg(&mut tx, &ViewerMsg::Seen { seq, spent_us }).await?;
+                        continue;
+                    }
+                    command = commands.recv() => match command {
+                        Some(command) => command,
+                        None => break,
+                    },
+                };
                 // Rajadas de movimento do mouse: só a posição mais recente
                 // interessa. O resto vai em ordem, sem perder nada.
                 while let Ok(next) = commands.try_recv() {
@@ -656,7 +679,11 @@ impl Task {
     }
 
     /// Recebe e aplica quadros até a conexão cair; devolve o erro que a parou.
-    async fn receive_video(&self, conn: &quinn::Connection) -> anyhow::Error {
+    async fn receive_video(
+        &self,
+        conn: &quinn::Connection,
+        seen: mpsc::UnboundedSender<(u32, Duration)>,
+    ) -> anyhow::Error {
         let mut stream = match conn.accept_uni().await.context("aguardar canal de vídeo") {
             Ok(stream) => stream,
             Err(err) => return err,
@@ -664,13 +691,18 @@ impl Task {
         loop {
             let step = async {
                 let bytes = read_frame(&mut stream, MAX_VIDEO_FRAME).await.context("receber quadro")?;
+                let received = Instant::now();
                 let packet = FramePacket::decode(&bytes)?;
                 let patches = tokio::task::block_in_place(|| decode_packet(&packet))?;
                 self.apply(&packet, &patches, bytes.len());
-                anyhow::Ok(())
+                anyhow::Ok((packet.seq, received.elapsed()))
             };
-            if let Err(err) = step.await {
-                return err;
+            match step.await {
+                // O quadro já está na tela: avisa o host, que só então
+                // considera a conexão livre para o próximo. Vai junto o tempo
+                // gasto aqui, que não é da conexão.
+                Ok(done) => drop(seen.send(done)),
+                Err(err) => return err,
             }
             (self.out.wake)();
         }

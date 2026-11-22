@@ -260,8 +260,10 @@ async fn granted_session_streams_screen_and_delivers_input() {
     ));
     assert!(viewer.rtt().is_some_and(|rtt| rtt < Duration::from_secs(1)));
     match next(&mut events).await {
-        ViewerEvent::Granted { permissions, display, index, displays } => {
+        ViewerEvent::Granted { permissions, display, index, displays, full_control } => {
             assert!(permissions.control);
+            // O host de teste é um programa comum: não promete o que não alcança.
+            assert!(!full_control);
             assert_eq!((display.width as usize, display.height as usize), (W, H));
             assert_eq!((index, displays), (0, 2));
         }

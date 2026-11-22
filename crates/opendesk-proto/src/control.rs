@@ -64,6 +64,10 @@ pub enum Decision {
         /// Qual dos monitores do host está sendo mostrado, e quantos há.
         index: u8,
         displays: u8,
+        /// O host alcança tudo: janelas de administrador, o aviso de
+        /// permissão do Windows e a tela de bloqueio. Falso quando ele roda
+        /// como programa comum, e então parte da tela não responde a cliques.
+        full_control: bool,
     },
     Denied {
         reason: DenyReason,
@@ -137,6 +141,16 @@ pub enum ViewerMsg {
     SelectDisplay(u8),
     /// Pede para bloquear a estação do host (exige permissão de controle).
     Lock,
+    /// O quadro de vídeo `seq` (e todos os anteriores) já está na tela de
+    /// quem vê. É por aqui que o host sabe quanto a conexão escoa, e só produz
+    /// o próximo quadro quando há caminho livre para ele. `spent_us` é o tempo
+    /// que quem vê levou para decodificar e aplicar o quadro, em
+    /// microssegundos: o host o desconta, para não confundir um computador
+    /// lento com uma conexão lenta.
+    Seen {
+        seq: u32,
+        spent_us: u32,
+    },
 }
 
 /// Host → visualizador.

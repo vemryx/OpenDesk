@@ -20,6 +20,31 @@ pub enum PatchEncoding {
     ZstdRgb = 0,
     /// JPEG baseline. Com perdas; o host reenvia sem perdas quando a tela para.
     Jpeg = 1,
+    /// JPEG da região reduzida à metade em cada eixo; quem recebe amplia.
+    /// É o que cabe numa conexão lenta quando a tela inteira muda.
+    JpegHalf = 2,
+    /// JPEG da região reduzida a um quarto em cada eixo.
+    JpegQuarter = 3,
+    /// JPEG da região reduzida a um oitavo em cada eixo: o último recurso,
+    /// para uma tela grande mudando inteira numa conexão muito lenta.
+    JpegEighth = 4,
+}
+
+impl PatchEncoding {
+    /// Por quanto cada eixo da região foi dividido antes de comprimir.
+    pub fn scale(self) -> usize {
+        match self {
+            Self::ZstdRgb | Self::Jpeg => 1,
+            Self::JpegHalf => 2,
+            Self::JpegQuarter => 4,
+            Self::JpegEighth => 8,
+        }
+    }
+
+    /// A imagem chega diferente da original e será reenviada sem perdas.
+    pub fn is_lossy(self) -> bool {
+        self != Self::ZstdRgb
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +116,9 @@ impl FramePacket {
             let encoding = match r.u8()? {
                 0 => PatchEncoding::ZstdRgb,
                 1 => PatchEncoding::Jpeg,
+                2 => PatchEncoding::JpegHalf,
+                3 => PatchEncoding::JpegQuarter,
+                4 => PatchEncoding::JpegEighth,
                 other => return Err(DecodeError::UnknownEncoding(other)),
             };
             let len = r.u32()? as usize;
@@ -142,6 +170,9 @@ mod tests {
             patches: vec![
                 Patch { x: 0, y: 0, w: 256, h: 256, encoding: PatchEncoding::ZstdRgb, data: vec![1, 2, 3] },
                 Patch { x: 1664, y: 824, w: 256, h: 256, encoding: PatchEncoding::Jpeg, data: vec![9; 40] },
+                Patch { x: 256, y: 0, w: 256, h: 200, encoding: PatchEncoding::JpegHalf, data: vec![4; 11] },
+                Patch { x: 512, y: 0, w: 130, h: 70, encoding: PatchEncoding::JpegQuarter, data: vec![5; 7] },
+                Patch { x: 0, y: 300, w: 1024, h: 512, encoding: PatchEncoding::JpegEighth, data: vec![6; 9] },
             ],
         }
     }

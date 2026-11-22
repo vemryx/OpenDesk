@@ -1,9 +1,9 @@
 //! Injeção de entrada com `SendInput`.
 //!
 //! Limitação do Windows (UIPI): um processo sem elevação não consegue injetar
-//! entrada em janelas elevadas nem na área de trabalho segura do UAC. Resolver
-//! isso do jeito certo exige o serviço previsto no roteiro; não há atalho
-//! seguro.
+//! entrada em janelas elevadas nem na área de trabalho segura do UAC. Por isso
+//! o mesmo `Injector` também roda dentro do [agente](super::agent), como
+//! SYSTEM, quando o serviço do OpenDesk está instalado.
 
 use crate::capture::DisplayInfo;
 use opendesk_proto::control::{InputEvent, MouseButton};
@@ -146,6 +146,11 @@ fn key_input(scancode: u16, extended: bool, down: bool) -> INPUT {
 fn send(inputs: &[INPUT]) {
     let sent = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
     if sent as usize != inputs.len() {
-        tracing::debug!("SendInput aceitou {sent} de {} eventos (janela elevada em foco?)", inputs.len());
+        // Não se repete a cada evento: uma sessão manda centenas por segundo.
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let error = windows::core::Error::from_thread();
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!("o Windows recusou a entrada ({sent} de {} eventos): {error}", inputs.len());
+        }
     }
 }

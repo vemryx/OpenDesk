@@ -10,11 +10,15 @@
 //! * [`files`] — transferência de arquivos durante a sessão.
 //! * [`backend`] — de onde vêm os quadros e para onde vai a entrada. A
 //!   implementação real usa `opendesk-platform`; os testes usam uma falsa.
+//! * [`pacing`] — o ritmo do vídeo: o host só produz um quadro quando a
+//!   conexão tem caminho livre, e do tamanho que ela escoa. É o que mantém o
+//!   atraso baixo numa conexão lenta.
 
 pub mod auth;
 pub mod backend;
 pub mod files;
 pub mod host;
+pub mod pacing;
 pub mod viewer;
 
 use std::sync::Arc;

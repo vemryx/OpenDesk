@@ -21,17 +21,19 @@ Acesso remoto ponto a ponto, gratuito e de código aberto. Uma alternativa ao An
 - Compartilhar a tela e controlar mouse e teclado de outro computador Windows.
 - **Conexão por ID**: um servidor de encontro apresenta os dois computadores e eles conectam direto um ao outro, perfurando o NAT. O servidor nunca vê a sessão.
 - **Relay opcional**: se a rede não deixar conectar direto, a sessão passa por um relay que você mesmo hospeda. Ele só repassa pacotes cifrados e não consegue ler nada.
+- **Controle total** (opcional): um serviço do sistema deixa quem acessa clicar em janelas de administrador, responder ao aviso de permissão do Windows (UAC) e ver a tela de bloqueio, que é onde um programa comum de acesso remoto para de responder. Sem ele, a barra da sessão avisa "Controle limitado" em vez de deixar você clicar no vazio.
 - **Transparência**: a barra da sessão mostra a rota (direta por endereço, rede local, ponto a ponto ou via relay), a latência, os quadros por segundo e o bitrate; codec e resolução aparecem ao passar o ponteiro.
 - **Autorização explícita**: por padrão, toda conexão precisa ser aprovada por quem está no computador, que escolhe entre só ver ou permitir controle. A sessão ativa fica sempre visível e pode ser encerrada com um clique.
 - **Acesso não supervisionado** (opcional, desligado de fábrica): com uma senha definida de propósito, dá para entrar em um computador seu sem ninguém aprovar. A senha nunca trafega (SPAKE2), tentativas erradas são contadas e bloqueiam a porta, e tudo fica no histórico.
 - **Durante a sessão**: área de transferência de texto entre os dois computadores, troca entre os monitores do computador remoto, tela cheia, pausar o controle e bloquear o computador remoto.
 - **Transferência de arquivos** nos dois sentidos: pelo menu Ações ou arrastando o arquivo para a tela remota. O que chega fica em `Downloads\OpenDesk`, nunca sobrescreve nada, e quem acessa confirma cada arquivo que o outro computador quiser mandar.
 - **Cifragem de ponta a ponta**: QUIC com TLS 1.3 e identidade criptográfica por dispositivo. Não há servidor que possa ler a sessão.
+- **Resposta rápida em conexão ruim**: o host mede quanto a conexão escoa e só produz um quadro quando há caminho livre para ele, do tamanho que cabe. Numa conexão lenta a imagem borra por um instante durante o movimento e volta a ficar nítida ao parar, em vez de atrasar segundos. Numa conexão simulada de 5 Mbit/s com 1% de perda, com a tela inteira rolando, o tempo do clique até a tela caiu de 8,9 s para 0,14 s ([medidas](docs/ARCHITECTURE.md#atraso)).
 - Imagem sem perdas para texto e interface, JPEG para foto e vídeo, com refinamento automático quando a tela para.
 - **Computadores recentes** na tela inicial: um clique reconecta.
-- **Configurações** para uso pessoal e para empresas: nome e tema; abrir com o Windows; aceitar ou não pedidos de acesso; limitar quem acessa a "só ver"; bloquear o Windows ao fim do acesso; área de transferência; transferência de arquivos; acesso não supervisionado; servidor de encontro e relay próprios; porta.
+- **Configurações** para uso pessoal e para empresas: nome e tema; abrir com o Windows; aceitar ou não pedidos de acesso; limitar quem acessa a "só ver"; controle total; bloquear o Windows ao fim do acesso; área de transferência; transferência de arquivos; acesso não supervisionado; servidor de encontro e relay próprios; porta.
 - **Histórico de sessões** em arquivo (`history.jsonl`, uma linha JSON por evento), com as sessões feitas e recebidas, os pedidos recusados, as senhas erradas e os arquivos trocados.
-- Um executável único, sem instalador.
+- Um executável único. Funciona sem instalar; a instalação existe só para o controle total.
 
 ## Usar
 
@@ -42,6 +44,12 @@ O app segue o tema claro ou escuro do Windows; `OPENDESK_THEME=light` ou `dark` 
 O ID vem do servidor de encontro do projeto. Para usar o seu, informe o endereço dele em **Configurações, Rede** (por exemplo `wss://seu-servidor.workers.dev`); lá também dá para desligar o servidor e ficar só com a conexão por endereço. Em implantações, as variáveis de ambiente `OPENDESK_RENDEZVOUS` (`off` desliga), `OPENDESK_RELAY` e `OPENDESK_PORT` fazem o mesmo e têm prioridade sobre a tela.
 
 Na primeira execução o Firewall do Windows pergunta se o OpenDesk pode receber conexões. Permita em redes privadas.
+
+### Controle total
+
+No computador que será acessado, abra **Configurações, Segurança** e clique em **Instalar** na linha "Controle total". O Windows pede permissão de administrador uma vez. O OpenDesk é copiado para `Arquivos de Programas\OpenDesk`, ganha um atalho no menu Iniciar, uma regra no firewall e um serviço do sistema; a partir daí, abra o OpenDesk pelo menu Iniciar. O mesmo lugar tem o botão **Remover**.
+
+Sem isso tudo continua funcionando, mas o Windows não deixa clicar em janelas de administrador nem no aviso de permissão, e a tela de bloqueio não aparece para quem acessa. O porquê e as garantias estão em [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#controle-total).
 
 ## Compilar
 
@@ -77,7 +85,9 @@ Em outro:
 target/release/opendesk-cli view 127.0.0.1:47811 --seconds 5 --out tela.png
 ```
 
-`--auto-accept-loopback` existe só para testes e restringe a escuta a `127.0.0.1`.
+Para medir o atraso sem um segundo computador, a CLI também simula uma conexão ruim (`netsim`) e uma tela de mentira (`host --synthetic`); o passo a passo está em [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#medidas).
+
+`--auto-accept-loopback` existe só para testes e restringe a escuta a `127.0.0.1`. Com `--control`, o `view` também clica num ponto da tela remota (`--click X,Y`) e pressiona teclas (`--press esquerda,enter`), opcionalmente depois de alguns segundos (`--after 5`), para conferir se a entrada chega a uma janela específica ou a um aviso que aparece no meio da sessão.
 
 ## Servidor de encontro
 
