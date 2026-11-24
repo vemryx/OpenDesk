@@ -7,6 +7,10 @@
 
 Acesso remoto ponto a ponto, gratuito e de código aberto. Uma alternativa ao AnyDesk sem conta, sem anúncios, sem limite de tempo e sem servidor no meio da sua conexão.
 
+### [⬇ Baixar o OpenDesk para Windows](https://github.com/vemryx/OpenDesk/releases/latest/download/OpenDesk-Setup.exe)
+
+Instalador para Windows 10 e 11 de 64 bits. Veja [como instalar](#instalar) e [todas as versões](https://github.com/vemryx/OpenDesk/releases).
+
 > **Estado: MVP.** Funciona entre computadores Windows: por ID pela internet, ou por endereço na mesma rede. A conexão entre duas redes diferentes ainda não foi testada em campo. Veja [o que falta](docs/ARCHITECTURE.md#roteiro).
 
 <picture>
@@ -37,7 +41,7 @@ Acesso remoto ponto a ponto, gratuito e de código aberto. Uma alternativa ao An
 
 ## Instalar
 
-Execute `OpenDesk-Setup-<versão>.exe` (gerado pelo CI a cada envio para o `main`, ou por `installer\build.ps1`). O Windows pede permissão de administrador uma vez e o instalador oferece três opções, todas marcadas: atalho na área de trabalho, abrir o OpenDesk com o Windows (minimizado, para o computador poder ser acessado a qualquer hora) e o [controle total](#controle-total). Ao terminar, o OpenDesk abre mostrando o ID deste computador. Ele também libera o programa no firewall, então não aparece pergunta nenhuma. Para remover, use **Configurações do Windows, Aplicativos, OpenDesk**.
+[Baixe o instalador](https://github.com/vemryx/OpenDesk/releases/latest/download/OpenDesk-Setup.exe) e execute. Quem compila o gera com `installer\build.ps1`, e o CI o gera a cada envio para o `main`. O Windows pede permissão de administrador uma vez e o instalador oferece três opções, todas marcadas: atalho na área de trabalho, abrir o OpenDesk com o Windows (minimizado, para o computador poder ser acessado a qualquer hora) e o [controle total](#controle-total). Ao terminar, o OpenDesk abre mostrando o ID deste computador. Ele também libera o programa no firewall, então não aparece pergunta nenhuma. Para remover, use **Configurações do Windows, Aplicativos, OpenDesk**.
 
 O instalador ainda não é assinado. Por isso o Windows pode mostrar "O Windows protegeu o computador": clique em **Mais informações** e depois em **Executar assim mesmo**.
 
