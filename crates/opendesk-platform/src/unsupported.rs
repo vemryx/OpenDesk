@@ -171,6 +171,7 @@ pub mod service {
         pub running: bool,
         pub path: Option<String>,
         pub current: bool,
+        pub packaged: bool,
     }
 
     pub fn state() -> ServiceState {

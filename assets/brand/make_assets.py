@@ -7,6 +7,10 @@ Saídas (em apps/opendesk/assets/):
   icon.png      ícone da janela (64 px)
   wordmark.png  o nome "OpenDesk" como máscara em tons de cinza, tingida pelo app
 
+E em installer/, as imagens do instalador:
+  wizard.png        painel lateral das telas de boas-vindas e de conclusão
+  wizard-small.png  o ícone no canto das outras telas
+
 O símbolo é redesenhado em geometria exata (medida no arquivo oficial) em vez
 de reduzido do PNG: assim os tamanhos pequenos saem nítidos e com traço mais
 grosso, como pede um ícone de 16 px. Requer Pillow.
@@ -17,6 +21,7 @@ from PIL import Image, ImageDraw
 
 HERE = Path(__file__).resolve().parent
 OUT = HERE.parent.parent / "apps" / "opendesk" / "assets"
+INSTALLER = HERE.parent.parent / "installer"
 
 NAVY = (1, 33, 86)
 BLUE = (1, 118, 251)
@@ -72,6 +77,19 @@ def icon(size):
     return img
 
 
+def wizard(width, height):
+    """Painel lateral do instalador: o símbolo em branco e azul sobre o azul-marinho."""
+    img = Image.new("RGBA", (width, height), NAVY + (255,))
+    size = round(width * 0.62)
+    front, back = mark(size, 0, STROKE)
+    clear = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    solid = lambda rgb: Image.new("RGBA", (size, size), rgb + (255,))
+    art = Image.composite(solid(BLUE), clear, back)
+    art.alpha_composite(Image.composite(solid((255, 255, 255)), clear, front))
+    img.alpha_composite(art, ((width - size) // 2, round(height * 0.30) - size // 2))
+    return img
+
+
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     sizes = [256, 64, 48, 40, 32, 24, 20, 16]
@@ -87,6 +105,12 @@ def main():
     alpha = alpha.resize((round(alpha.width * height / alpha.height), height), Image.LANCZOS)
     alpha.save(OUT / "wordmark.png", optimize=True)
     print("wordmark", alpha.size, "| ícones", sizes)
+
+    # Desenhadas em 200% (o instalador reduz para a escala da tela).
+    INSTALLER.mkdir(exist_ok=True)
+    wizard(328, 628).convert("RGB").save(INSTALLER / "wizard.png", optimize=True)
+    icon(110).save(INSTALLER / "wizard-small.png", optimize=True)
+    print("instalador: wizard.png, wizard-small.png")
 
 
 if __name__ == "__main__":

@@ -34,6 +34,23 @@ jobs:
             target/release/opendesk-cli.exe
             target/release/opendesk-relay.exe
           if-no-files-found: error
+      # O estilo do instalador (claro e escuro conforme o Windows) pede o Inno Setup 6.7.
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          $setup = "$env:RUNNER_TEMP\innosetup.exe"
+          Invoke-WebRequest https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe -OutFile $setup
+          if ((Get-AuthenticodeSignature $setup).Status -ne 'Valid') { throw 'assinatura do Inno Setup inválida' }
+          Start-Process $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=$env:RUNNER_TEMP\innosetup" -Wait
+          "ISCC=$env:RUNNER_TEMP\innosetup\ISCC.exe" >> $env:GITHUB_ENV
+      - name: Instalador
+        shell: pwsh
+        run: ./installer/build.ps1 -SkipBuild
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opendesk-setup
+          path: target/installer/OpenDesk-Setup-*.exe
+          if-no-files-found: error
 
   relay-linux:
     name: Relay (Linux)

@@ -63,6 +63,10 @@ pub struct ServiceState {
     pub path: Option<String>,
     /// Este processo é esse executável. Só ele pode usar o controle total.
     pub current: bool,
+    /// O OpenDesk em `Arquivos de Programas` veio do instalador, que é dono
+    /// dele: remover o serviço não apaga o programa, o atalho nem a regra do
+    /// firewall, que saem pela desinstalação do Windows.
+    pub packaged: bool,
 }
 
 struct Sc(SC_HANDLE);
@@ -91,16 +95,25 @@ fn status(service: &Sc) -> Option<SERVICE_STATUS_CURRENT_STATE> {
 
 /// Consulta o serviço. Não exige administrador.
 pub fn state() -> ServiceState {
-    let Ok(manager) = manager(SC_MANAGER_CONNECT) else { return ServiceState::default() };
+    let packaged = packaged();
+    let missing = ServiceState { packaged, ..Default::default() };
+    let Ok(manager) = manager(SC_MANAGER_CONNECT) else { return missing };
     let Ok(service) = open(&manager, SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG) else {
-        return ServiceState::default();
+        return missing;
     };
     let path = binary_path(&service);
     let current = match (&path, own_image()) {
         (Some(path), Ok(own)) => path.eq_ignore_ascii_case(&own),
         _ => false,
     };
-    ServiceState { installed: true, running: status(&service) == Some(SERVICE_RUNNING), path, current }
+    ServiceState { installed: true, running: status(&service) == Some(SERVICE_RUNNING), path, current, packaged }
+}
+
+/// O desinstalador que o instalador deixa ao lado do executável.
+const UNINSTALLER: &str = "unins000.exe";
+
+fn packaged() -> bool {
+    install_dir().is_ok_and(|dir| dir.join(UNINSTALLER).exists())
 }
 
 /// O executável registrado no serviço, sem as aspas e sem os argumentos.
@@ -225,6 +238,11 @@ pub fn install() -> Result<()> {
     }
     unsafe { StartServiceW(service.0, None) }.context("iniciar o serviço")?;
 
+    // O atalho e a regra do firewall do OpenDesk instalado pelo instalador
+    // são dele, que os cria e os remove.
+    if packaged() {
+        return Ok(());
+    }
     if let Err(err) = shortcut_path().and_then(|link| create_shortcut(&target, &link)) {
         tracing::warn!("atalho no menu Iniciar não criado: {err:#}");
     }
@@ -285,11 +303,17 @@ fn copy_when_free(source: &Path, target: &Path) -> Result<()> {
 }
 
 /// Para e remove o serviço e o que a instalação criou. Precisa de administrador.
+///
+/// Quando o OpenDesk veio do instalador, remove só o serviço: o resto é do
+/// instalador, e é ele quem chama isto ao desinstalar.
 pub fn uninstall() -> Result<()> {
     let manager = manager(SC_MANAGER_ALL_ACCESS).context("remover o serviço exige permissão de administrador")?;
     if let Ok(service) = open(&manager, SERVICE_ALL_ACCESS) {
         stop_and_wait(&service);
         unsafe { DeleteService(service.0) }.context("remover o serviço")?;
+    }
+    if packaged() {
+        return Ok(());
     }
     if let Ok(link) = shortcut_path() {
         let _ = std::fs::remove_file(link);

@@ -33,7 +33,15 @@ Acesso remoto ponto a ponto, gratuito e de código aberto. Uma alternativa ao An
 - **Computadores recentes** na tela inicial: um clique reconecta.
 - **Configurações** para uso pessoal e para empresas: nome e tema; abrir com o Windows; aceitar ou não pedidos de acesso; limitar quem acessa a "só ver"; controle total; bloquear o Windows ao fim do acesso; área de transferência; transferência de arquivos; acesso não supervisionado; servidor de encontro e relay próprios; porta.
 - **Histórico de sessões** em arquivo (`history.jsonl`, uma linha JSON por evento), com as sessões feitas e recebidas, os pedidos recusados, as senhas erradas e os arquivos trocados.
-- Um executável único. Funciona sem instalar; a instalação existe só para o controle total.
+- **Instalador de um clique**, ou um executável único que funciona sem instalar.
+
+## Instalar
+
+Execute `OpenDesk-Setup-<versão>.exe` (gerado pelo CI a cada envio para o `main`, ou por `installer\build.ps1`). O Windows pede permissão de administrador uma vez e o instalador oferece três opções, todas marcadas: atalho na área de trabalho, abrir o OpenDesk com o Windows (minimizado, para o computador poder ser acessado a qualquer hora) e o [controle total](#controle-total). Ao terminar, o OpenDesk abre mostrando o ID deste computador. Ele também libera o programa no firewall, então não aparece pergunta nenhuma. Para remover, use **Configurações do Windows, Aplicativos, OpenDesk**.
+
+O instalador ainda não é assinado. Por isso o Windows pode mostrar "O Windows protegeu o computador": clique em **Mais informações** e depois em **Executar assim mesmo**.
+
+Sem instalar, o `opendesk.exe` funciona de qualquer pasta.
 
 ## Usar
 
@@ -43,11 +51,11 @@ O app segue o tema claro ou escuro do Windows; `OPENDESK_THEME=light` ou `dark` 
 
 O ID vem do servidor de encontro do projeto. Para usar o seu, informe o endereço dele em **Configurações, Rede** (por exemplo `wss://seu-servidor.workers.dev`); lá também dá para desligar o servidor e ficar só com a conexão por endereço. Em implantações, as variáveis de ambiente `OPENDESK_RENDEZVOUS` (`off` desliga), `OPENDESK_RELAY` e `OPENDESK_PORT` fazem o mesmo e têm prioridade sobre a tela.
 
-Na primeira execução o Firewall do Windows pergunta se o OpenDesk pode receber conexões. Permita em redes privadas.
+Sem o instalador, na primeira execução o Firewall do Windows pergunta se o OpenDesk pode receber conexões. Permita em redes privadas.
 
 ### Controle total
 
-No computador que será acessado, abra **Configurações, Segurança** e clique em **Instalar** na linha "Controle total". O Windows pede permissão de administrador uma vez. O OpenDesk é copiado para `Arquivos de Programas\OpenDesk`, ganha um atalho no menu Iniciar, uma regra no firewall e um serviço do sistema; a partir daí, abra o OpenDesk pelo menu Iniciar. O mesmo lugar tem o botão **Remover**.
+O instalador já ativa o controle total, se a opção ficar marcada. Para ativar depois, ou sem o instalador: no computador que será acessado, abra **Configurações, Segurança** e clique em **Instalar** na linha "Controle total". O Windows pede permissão de administrador uma vez. O OpenDesk é copiado para `Arquivos de Programas\OpenDesk`, ganha um atalho no menu Iniciar, uma regra no firewall e um serviço do sistema; a partir daí, abra o OpenDesk pelo menu Iniciar. O mesmo lugar tem o botão **Remover**; no OpenDesk que veio do instalador, ele tira só o serviço.
 
 Sem isso tudo continua funcionando, mas o Windows não deixa clicar em janelas de administrador nem no aviso de permissão, e a tela de bloqueio não aparece para quem acessa. O porquê e as garantias estão em [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#controle-total).
 
@@ -63,6 +71,12 @@ Os executáveis ficam em `target/release/`: `opendesk.exe` (aplicativo), `opende
 
 ```bash
 cargo test
+```
+
+O instalador sai em `target/installer/` e precisa do [Inno Setup](https://jrsoftware.org/isinfo.php) 6.7 ou mais novo:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File installer\build.ps1
 ```
 
 Testes que tocam a tela e o mouse reais ficam ignorados por padrão:

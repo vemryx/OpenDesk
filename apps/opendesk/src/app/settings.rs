@@ -70,6 +70,15 @@ enum FullControlAction {
     OpenInstalled,
 }
 
+/// O que "Remover" tira do computador.
+fn remove_hint(state: &ServiceState) -> &'static str {
+    if state.packaged {
+        "Remove o serviço. O OpenDesk continua instalado"
+    } else {
+        "Remove o serviço e o OpenDesk instalado"
+    }
+}
+
 impl FullControl {
     /// De quanto em quanto tempo a tela confere o serviço.
     const EVERY: Duration = Duration::from_secs(2);
@@ -305,15 +314,15 @@ impl App {
                     ("Atualizar", "Substitui o OpenDesk instalado por esta versão", FullControlAction::Install),
                 ],
             ),
-            _ if control.active => (
+            state if control.active => (
                 "Ativo. Quem acessa com controle alcança janelas de administrador, o aviso de permissão do Windows e a tela de bloqueio.",
-                &[("Remover", "Remove o serviço e o OpenDesk instalado", FullControlAction::Remove)],
+                &[("Remover", remove_hint(state), FullControlAction::Remove)],
             ),
-            _ => (
+            state => (
                 "Instalado, mas o serviço não está respondendo.",
                 &[
                     ("Reparar", "Reinstala e reinicia o serviço", FullControlAction::Install),
-                    ("Remover", "Remove o serviço e o OpenDesk instalado", FullControlAction::Remove),
+                    ("Remover", remove_hint(state), FullControlAction::Remove),
                 ],
             ),
         };
@@ -361,7 +370,8 @@ impl App {
     pub(super) fn poll_service_job(&mut self) {
         let control = &mut self.full_control;
         let Some((job, result)) = &control.job else { return };
-        let (job, was_installed_copy) = (*job, control.state.current);
+        // Do instalador, o OpenDesk continua no disco depois de remover o serviço.
+        let (job, was_installed_copy) = (*job, control.state.current && !control.state.packaged);
         let outcome = match result.try_recv() {
             Err(TryRecvError::Empty) => return,
             Ok(outcome) => outcome,
@@ -376,6 +386,10 @@ impl App {
         let active = control.active;
         let text = match job {
             Job::Install if active => "Controle total ativo.",
+            // O serviço acabou de subir e o agente ainda está abrindo.
+            Job::Install if self.full_control.state.current => {
+                "Instalado. O controle total fica ativo em alguns segundos."
+            }
             Job::Install => "Instalado. Abra o OpenDesk pelo menu Iniciar para usar o controle total.",
             // Este é o OpenDesk que acabou de ser desinstalado: some do disco
             // ao reiniciar, e um registro para abri-lo ficaria apontando para nada.
